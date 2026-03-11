@@ -97,16 +97,25 @@ IPAdicのCSVを直接パースする。後者のほうが依存が軽い。
 
 | Crate | Downloads | Last Update | API | Verdict |
 |-------|-----------|-------------|-----|---------|
-| `candle-core`+`candle-nn` | 高 | Active (HuggingFace) | Tensor ops + nn modules | **ADOPT** |
+| `llama-cpp-2` | 高 | Active | llama.cpp bindings, GGUF load | **ADOPT** |
+| `candle-core`+`candle-nn` | 高 | Active (HuggingFace) | Tensor ops + nn modules | ~~Evaluated~~ Requires hand-written Transformer |
 | `ort` (ONNX Runtime) | 中 | Active | ONNX model loading | C++ dependency, heavy |
 | `tch-rs` (LibTorch) | 中 | Active | PyTorch bindings | C++ dependency, 2GB+ |
-| `burn` | 中 | Active | Pure Rust ML | API less mature than candle |
 
-### Decision: `candle` を採用
+### Decision: `llama-cpp-2` + jinen model (from karukan project)
 
-pure-Rust で依存が軽く、safetensors ロードをネイティブサポート。
-IME はユーザーの PC で動くので、C++ ランタイム依存は避けたい。
-candle は HuggingFace 公式で LLM 推論に実績あり。
+Initially implemented with `candle` (hand-written Transformer, ~200 lines).
+Replaced with `llama-cpp-2` for the following reasons:
+
+1. **Reuse-first**: jinen (GPT-2 26M params, trained on Japanese) is publicly available
+   on HuggingFace. No need to train our own model.
+2. **No hand-written Transformer**: candle approach required implementing
+   CausalSelfAttention, TransformerBlock, etc. — bug-prone and hard to test.
+3. **Quality**: 26M param pre-trained model >> 2M param model we'd train ourselves.
+4. **llama.cpp maturity**: Battle-tested inference engine with extensive optimization.
+
+Trade-off: `llama-cpp-2` depends on llama.cpp (C++ via cmake). This adds build
+complexity but is well-supported on all platforms (Linux, macOS, Windows).
 
 ---
 
