@@ -292,6 +292,119 @@ impl Lattice {
         segments.reverse();
         Ok(segments)
     }
+
+    /// Find N-best paths through the lattice.
+    ///
+    /// Returns up to `n` paths, each as a `(cost, Vec<Segment>)` pair, sorted
+    /// by total cost ascending. Uses an iterative penalty approach: after
+    /// finding each path, edges on that path receive a cost penalty to force
+    /// the next iteration to explore alternative routes.
+    pub fn find_nbest_paths(
+        &self,
+        n: usize,
+        conn: Option<&ConnectionCost>,
+        initial_right_id: u16,
+    ) -> Result<Vec<(i64, Vec<Segment>)>, ConvertError> {
+        if self.input_len == 0 {
+            return Err(ConvertError::EmptyInput);
+        }
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Collect paths by repeatedly finding best path with edge penalties.
+        // We may need more iterations than n because some paths produce
+        // duplicate surface sequences (e.g., different passthrough splits).
+        let mut results: Vec<(i64, Vec<Segment>)> = Vec::new();
+        let mut penalties: Vec<Vec<i64>> = self
+            .edges
+            .iter()
+            .map(|edges_at_pos| vec![0i64; edges_at_pos.len()])
+            .collect();
+        let mut seen_surfaces: Vec<String> = Vec::new();
+        let max_iters = n * 4; // Allow extra iterations for dedup
+
+        for _ in 0..max_iters {
+            if results.len() >= n {
+                break;
+            }
+            // Forward pass with penalties
+            let node_count = self.input_len + 1;
+            let mut best_cost: Vec<i64> = vec![i64::MAX; node_count];
+            let mut back_ptr: Vec<Option<(usize, usize)>> = vec![None; node_count];
+            let mut best_right_id: Vec<u16> = vec![UNKNOWN_CONTEXT_ID; node_count];
+
+            best_cost[0] = 0;
+            best_right_id[0] = initial_right_id;
+
+            for start in 0..self.input_len {
+                if best_cost[start] == i64::MAX {
+                    continue;
+                }
+                for (edge_idx, edge) in self.edges[start].iter().enumerate() {
+                    let connection_cost = match conn {
+                        Some(c) => c.cost(best_right_id[start], edge.left_id) as i64,
+                        None => 0,
+                    };
+                    let total = best_cost[start]
+                        + edge.cost as i64
+                        + connection_cost
+                        + penalties[start][edge_idx];
+
+                    if total < best_cost[edge.end] {
+                        best_cost[edge.end] = total;
+                        back_ptr[edge.end] = Some((start, edge_idx));
+                        best_right_id[edge.end] = edge.right_id;
+                    }
+                }
+            }
+
+            if best_cost[self.input_len] == i64::MAX {
+                break; // No more reachable paths
+            }
+
+            // Backward trace
+            let mut segments = Vec::new();
+            let mut path_edges: Vec<(usize, usize)> = Vec::new();
+            let mut pos = self.input_len;
+            while pos > 0 {
+                let (start, edge_idx) = match back_ptr[pos] {
+                    Some(p) => p,
+                    None => break,
+                };
+                let edge = &self.edges[start][edge_idx];
+                segments.push(Segment {
+                    surface: edge.surface.clone(),
+                    reading: edge.reading.clone(),
+                    cost: edge.cost,
+                    left_id: edge.left_id,
+                    right_id: edge.right_id,
+                });
+                path_edges.push((start, edge_idx));
+                pos = start;
+            }
+            segments.reverse();
+
+            let cost = best_cost[self.input_len];
+
+            // Check for duplicate concatenated surface text
+            let concat_surface: String = segments.iter().map(|s| s.surface.as_str()).collect();
+            let is_dup = seen_surfaces.contains(&concat_surface);
+
+            if !is_dup {
+                seen_surfaces.push(concat_surface);
+                results.push((cost, segments));
+            }
+
+            // Penalize edges on this path to find alternative paths
+            // Apply increasing penalty to force genuinely different paths
+            for (start, edge_idx) in &path_edges {
+                penalties[*start][*edge_idx] += 10000;
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 /// High-level conversion function (unigram only, no connection costs).
@@ -328,6 +441,23 @@ pub fn convert_with_conn_ctx(
     }
     let lattice = Lattice::build(input, dict);
     lattice.find_best_path(Some(conn), initial_right_id)
+}
+
+/// Find N-best conversion paths with connection costs.
+///
+/// Returns up to `n` paths, each as `(total_cost, segments)`, sorted by
+/// cost ascending. The first path is identical to `convert_with_conn`.
+pub fn convert_nbest(
+    input: &str,
+    dict: &Dictionary,
+    conn: &ConnectionCost,
+    n: usize,
+) -> Result<Vec<(i64, Vec<Segment>)>, ConvertError> {
+    if input.is_empty() {
+        return Err(ConvertError::EmptyInput);
+    }
+    let lattice = Lattice::build(input, dict);
+    lattice.find_nbest_paths(n, Some(conn), UNKNOWN_CONTEXT_ID)
 }
 
 /// Retrieve candidate surface forms for a given hiragana reading.
@@ -638,5 +768,90 @@ mod tests {
         // Hiragana passthrough cost should use hiragana formula, not 30000
         let passthrough = candidates.iter().find(|c| c.surface == "してい").unwrap();
         assert_eq!(passthrough.cost, hiragana_passthrough_cost(3)); // 8000
+    }
+
+    #[test]
+    fn test_nbest_returns_multiple_paths() {
+        // "きょう" has multiple candidates: 今日(3000), 教(6000), 京(7000)
+        let dict = test_dict();
+        let lattice = Lattice::build("きょう", &dict);
+        let paths = lattice
+            .find_nbest_paths(5, None, UNKNOWN_CONTEXT_ID)
+            .unwrap();
+
+        assert!(
+            paths.len() >= 2,
+            "expected at least 2 paths, got {}",
+            paths.len()
+        );
+        // First path should be lowest cost (今日)
+        let first_surface: String = paths[0].1.iter().map(|s| s.surface.as_str()).collect();
+        assert_eq!(first_surface, "今日");
+
+        // Costs should be non-decreasing
+        for i in 1..paths.len() {
+            assert!(
+                paths[i].0 >= paths[i - 1].0,
+                "paths not sorted by cost: {} < {}",
+                paths[i].0,
+                paths[i - 1].0,
+            );
+        }
+    }
+
+    #[test]
+    fn test_nbest_no_duplicate_surfaces() {
+        let dict = test_dict();
+        let lattice = Lattice::build("きょう", &dict);
+        let paths = lattice
+            .find_nbest_paths(10, None, UNKNOWN_CONTEXT_ID)
+            .unwrap();
+
+        let surfaces: Vec<String> = paths
+            .iter()
+            .map(|(_, segs)| segs.iter().map(|s| s.surface.as_str()).collect::<String>())
+            .collect();
+        // No two paths should have the same surface sequence
+        for i in 0..surfaces.len() {
+            for j in (i + 1)..surfaces.len() {
+                assert_ne!(
+                    surfaces[i], surfaces[j],
+                    "duplicate surface: {}",
+                    surfaces[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_nbest_single() {
+        let dict = test_dict();
+        let lattice = Lattice::build("きょう", &dict);
+        let paths = lattice
+            .find_nbest_paths(1, None, UNKNOWN_CONTEXT_ID)
+            .unwrap();
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn test_convert_nbest_high_level() {
+        let csv = "今日,1,1,2000,名詞,一般,*,*,*,*,今日,キョウ,キョー\n\
+                   は,2,2,2000,助詞,係助詞,*,*,*,*,は,ハ,ワ\n\
+                   今日は,3,3,6000,感動詞,*,*,*,*,*,今日は,キョウハ,キョーワ\n";
+        let reader = std::io::BufReader::new(csv.as_bytes());
+        let dict = Dictionary::load_from_reader(reader).unwrap();
+        let matrix = "4 4\n1 2 5000\n";
+        let conn = ConnectionCost::from_reader(std::io::BufReader::new(matrix.as_bytes())).unwrap();
+
+        let paths = convert_nbest("きょうは", &dict, &conn, 5).unwrap();
+        assert!(!paths.is_empty());
+
+        // Should have different segmentations
+        let surface_sets: Vec<String> = paths
+            .iter()
+            .map(|(_, segs)| segs.iter().map(|s| s.surface.as_str()).collect::<String>())
+            .collect();
+        // At least the best path
+        assert!(surface_sets.iter().any(|s| s.contains("今日")));
     }
 }
