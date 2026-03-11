@@ -205,14 +205,19 @@ impl LiveEngine {
 
     /// Commit the current composition and reset for new input.
     ///
-    /// Returns the final converted text.
+    /// Returns the final converted text. If cached segments exist (e.g.
+    /// from candidate selection), uses those instead of re-running
+    /// conversion.
     pub fn commit(&mut self) -> String {
         // Flush any pending romaji
         let flushed = self.romaji.flush_pending();
         self.hiragana_buf.push_str(&flushed);
 
-        let result = if self.hiragana_buf.is_empty() {
+        let result = if self.hiragana_buf.is_empty() && self.cached_segments.is_none() {
             String::new()
+        } else if let Some(ref segments) = self.cached_segments {
+            // Use cached segments (preserves candidate selections)
+            segments.iter().map(|s| s.surface.as_str()).collect()
         } else {
             match convert_with_conn_ctx(
                 &self.hiragana_buf,
@@ -501,6 +506,170 @@ impl LiveEngine {
     pub fn active_segment_index(&self) -> usize {
         self.active_segment
     }
+
+    /// Extend the active segment by absorbing one character from the next segment.
+    ///
+    /// Merges the first character of the next segment's reading into the active
+    /// segment, then re-looks up candidates for both affected segments.
+    /// Does nothing if the active segment is the last one, or if the next
+    /// segment has no characters to give.
+    pub fn extend_segment(&mut self) {
+        if self.mode != EngineMode::Selecting {
+            return;
+        }
+        let (new_active_reading, remaining_next) = {
+            let segments = match self.cached_segments {
+                Some(ref segs) => segs,
+                None => return,
+            };
+            let idx = self.active_segment;
+            if idx + 1 >= segments.len() {
+                return;
+            }
+
+            let next_reading = &segments[idx + 1].reading;
+            let first_char = match next_reading.chars().next() {
+                Some(c) => c,
+                None => return,
+            };
+            let first_char_len = first_char.len_utf8();
+            let remaining = &next_reading[first_char_len..];
+
+            let new_active = format!("{}{}", segments[idx].reading, first_char);
+            let remaining_opt = if remaining.is_empty() {
+                None
+            } else {
+                Some(remaining.to_string())
+            };
+            (new_active, remaining_opt)
+        };
+
+        self.rebuild_segments_after_resize(
+            self.active_segment,
+            &new_active_reading,
+            remaining_next,
+        );
+    }
+
+    /// Shrink the active segment by moving its last character to the next segment.
+    ///
+    /// Removes the last character from the active segment's reading and
+    /// prepends it to the next segment. If the active segment would become
+    /// empty, does nothing. If there is no next segment, a new one is
+    /// created.
+    pub fn shrink_segment(&mut self) {
+        if self.mode != EngineMode::Selecting {
+            return;
+        }
+        let (new_active_reading, new_next_reading) = {
+            let segments = match self.cached_segments {
+                Some(ref segs) => segs,
+                None => return,
+            };
+            let idx = self.active_segment;
+            let reading = &segments[idx].reading;
+
+            // Must have at least 2 characters to shrink
+            if reading.chars().count() < 2 {
+                return;
+            }
+
+            let last_char = reading.chars().last().unwrap();
+            let last_char_len = last_char.len_utf8();
+            let new_active = reading[..reading.len() - last_char_len].to_string();
+
+            let new_next = if idx + 1 < segments.len() {
+                format!("{}{}", last_char, segments[idx + 1].reading)
+            } else {
+                last_char.to_string()
+            };
+            (new_active, new_next)
+        };
+
+        self.rebuild_segments_after_resize(
+            self.active_segment,
+            &new_active_reading,
+            Some(new_next_reading),
+        );
+    }
+
+    /// Rebuild cached segments and candidate lists after a segment boundary change.
+    ///
+    /// `idx` is the active segment index. `new_active_reading` is the new reading
+    /// for the active segment. `new_next_reading` is the new reading for the
+    /// segment after it (`None` means the next segment was fully absorbed).
+    fn rebuild_segments_after_resize(
+        &mut self,
+        idx: usize,
+        new_active_reading: &str,
+        new_next_reading: Option<String>,
+    ) {
+        let segments = match self.cached_segments {
+            Some(ref mut segs) => segs,
+            None => return,
+        };
+
+        // Determine best candidate for the new active reading
+        let active_candidates = candidates_for_reading(new_active_reading, &self.dict);
+        let best_active = active_candidates.first().cloned().unwrap_or(Segment {
+            surface: new_active_reading.to_string(),
+            reading: new_active_reading.to_string(),
+            cost: 30000,
+            left_id: 0,
+            right_id: 0,
+        });
+
+        // Update the active segment
+        segments[idx] = best_active;
+
+        match new_next_reading {
+            Some(next_reading) => {
+                let next_candidates = candidates_for_reading(&next_reading, &self.dict);
+                let best_next = next_candidates.first().cloned().unwrap_or(Segment {
+                    surface: next_reading.clone(),
+                    reading: next_reading.clone(),
+                    cost: 30000,
+                    left_id: 0,
+                    right_id: 0,
+                });
+
+                if idx + 1 < segments.len() {
+                    // Replace existing next segment
+                    segments[idx + 1] = best_next;
+                } else {
+                    // Insert a new segment after the active one
+                    segments.push(best_next);
+                }
+
+                // Rebuild candidate lists for both affected segments
+                self.segment_candidates[idx] = active_candidates;
+                self.candidate_indices[idx] = 0;
+
+                let next_cands = candidates_for_reading(&next_reading, &self.dict);
+                if idx + 1 < self.segment_candidates.len() {
+                    self.segment_candidates[idx + 1] = next_cands;
+                    self.candidate_indices[idx + 1] = 0;
+                } else {
+                    self.segment_candidates.push(next_cands);
+                    self.candidate_indices.push(0);
+                }
+            }
+            None => {
+                // Next segment was fully absorbed — remove it
+                if idx + 1 < segments.len() {
+                    segments.remove(idx + 1);
+                }
+                if idx + 1 < self.segment_candidates.len() {
+                    self.segment_candidates.remove(idx + 1);
+                    self.candidate_indices.remove(idx + 1);
+                }
+
+                // Rebuild candidate list for the active segment
+                self.segment_candidates[idx] = active_candidates;
+                self.candidate_indices[idx] = 0;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -751,5 +920,124 @@ mod tests {
         // Typing a new character should exit selection
         engine.on_key('h');
         assert_eq!(*engine.mode(), EngineMode::Composing);
+    }
+
+    #[test]
+    fn test_engine_confirm_preserves_selected_candidate() {
+        // Build engine with multiple candidates for "きょう"
+        let csv = "今日,1,1,3000,名詞,一般,*,*,*,*,今日,キョウ,キョー\n\
+                   京,2,2,7000,名詞,固有名詞,*,*,*,*,京,キョウ,キョー\n\
+                   は,10,10,4000,助詞,係助詞,*,*,*,*,は,ハ,ワ\n";
+        let dict = Dictionary::load_from_reader(std::io::BufReader::new(csv.as_bytes())).unwrap();
+        let matrix = "12 12\n";
+        let conn = ConnectionCost::from_reader(std::io::BufReader::new(matrix.as_bytes())).unwrap();
+        let mut engine = LiveEngine::new(dict, conn);
+
+        for ch in "kyou".chars() {
+            engine.on_key(ch);
+        }
+        // Composing should be "今日" (lowest cost)
+        engine.enter_selection();
+        // Switch to "京" (next candidate)
+        engine.next_candidate();
+        let segs = engine.display_segments();
+        assert_eq!(segs[0].surface, "京");
+
+        // Confirm should commit "京", not revert to "今日"
+        let committed = engine.confirm_selection();
+        assert_eq!(committed, "京");
+    }
+
+    #[test]
+    fn test_engine_extend_segment() {
+        // Force 2 segments: 今日は(9000) > 今日(3000) + は(4000) = 7000
+        // Then extending first should merge "きょう" + "は" → "きょうは"
+        let csv = "今日,1,1,3000,名詞,一般,*,*,*,*,今日,キョウ,キョー\n\
+                   今日は,5,5,2500,感動詞,*,*,*,*,*,今日は,キョウハ,キョーワ\n\
+                   は,10,10,4000,助詞,係助詞,*,*,*,*,は,ハ,ワ\n";
+        let dict = Dictionary::load_from_reader(std::io::BufReader::new(csv.as_bytes())).unwrap();
+        // High connection cost between 今日→は to NOT force single segment
+        // (doesn't matter, Viterbi picks 今日は as single segment at cost 2500)
+        let matrix = "12 12\n";
+        let conn = ConnectionCost::from_reader(std::io::BufReader::new(matrix.as_bytes())).unwrap();
+        let mut engine = LiveEngine::new(dict, conn);
+
+        for ch in "kyouha".chars() {
+            engine.on_key(ch);
+        }
+        engine.enter_selection();
+
+        let segs_before = engine.display_segments();
+        // Viterbi picks "今日は" as a single segment (cost 2500)
+        // So we shrink it first to create two segments, then extend
+        engine.shrink_segment();
+        let segs_after_shrink = engine.display_segments();
+        assert!(
+            segs_after_shrink.len() > segs_before.len(),
+            "shrink should create more segments"
+        );
+
+        // Now extend back — should merge the char back
+        let reading_before_extend = segs_after_shrink[0].reading.clone();
+        engine.extend_segment();
+        let segs_after_extend = engine.display_segments();
+        assert!(segs_after_extend[0].reading.len() > reading_before_extend.len());
+    }
+
+    #[test]
+    fn test_engine_shrink_segment() {
+        let csv = "今日,1,1,3000,名詞,一般,*,*,*,*,今日,キョウ,キョー\n\
+                   は,10,10,4000,助詞,係助詞,*,*,*,*,は,ハ,ワ\n";
+        let dict = Dictionary::load_from_reader(std::io::BufReader::new(csv.as_bytes())).unwrap();
+        let matrix = "12 12\n";
+        let conn = ConnectionCost::from_reader(std::io::BufReader::new(matrix.as_bytes())).unwrap();
+        let mut engine = LiveEngine::new(dict, conn);
+
+        for ch in "kyou".chars() {
+            engine.on_key(ch);
+        }
+        engine.enter_selection();
+
+        let segs_before = engine.display_segments();
+        let reading_before = segs_before[0].reading.clone();
+
+        engine.shrink_segment();
+
+        let segs_after = engine.display_segments();
+        // Active segment reading should be shorter
+        assert!(segs_after[0].reading.len() < reading_before.len());
+        // There should be a next segment with the displaced character
+        assert!(segs_after.len() > segs_before.len());
+    }
+
+    #[test]
+    fn test_engine_shrink_single_char_noop() {
+        let mut engine = test_engine();
+        // "は" → single-char segment
+        for ch in "ha".chars() {
+            engine.on_key(ch);
+        }
+        engine.enter_selection();
+
+        let segs_before = engine.display_segments();
+        engine.shrink_segment();
+        let segs_after = engine.display_segments();
+        // Should not change (can't shrink single char)
+        assert_eq!(segs_before, segs_after);
+    }
+
+    #[test]
+    fn test_engine_extend_last_segment_noop() {
+        let mut engine = test_engine();
+        for ch in "kyou".chars() {
+            engine.on_key(ch);
+        }
+        engine.enter_selection();
+
+        // Only one segment, extending should be a no-op
+        let segs_before = engine.display_segments();
+        engine.extend_segment();
+        let segs_after = engine.display_segments();
+        assert_eq!(segs_before, segs_after);
     }
 }

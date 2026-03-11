@@ -147,7 +147,7 @@ fn run_app(
                         if engine.enter_selection() {
                             sync_state(&mut state, engine);
                             state.status =
-                                "Space/\u{2193}=next  \u{2191}=prev  \u{2190}\u{2192}=segment  Enter=confirm  Esc=cancel".into();
+                                "Space/\u{2193}=next  \u{2191}=prev  \u{2190}\u{2192}=segment  Shift+\u{2190}\u{2192}=resize  Enter=confirm  Esc=cancel".into();
                         }
                     } else {
                         // No composing text → insert space
@@ -168,13 +168,21 @@ fn run_app(
                 }
                 KeyCode::Right => {
                     if *engine.mode() == EngineMode::Selecting {
-                        engine.next_segment();
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            engine.extend_segment();
+                        } else {
+                            engine.next_segment();
+                        }
                         sync_state(&mut state, engine);
                     }
                 }
                 KeyCode::Left => {
                     if *engine.mode() == EngineMode::Selecting {
-                        engine.prev_segment();
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            engine.shrink_segment();
+                        } else {
+                            engine.prev_segment();
+                        }
                         sync_state(&mut state, engine);
                     }
                 }
