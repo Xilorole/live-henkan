@@ -8,3 +8,4 @@ thiserror.workspace = true
 romaji = { path = "../romaji" }
 dictionary = { path = "../dictionary" }
 converter = { path = "../converter" }
+scorer = { path = "../scorer" }

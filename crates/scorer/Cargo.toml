@@ -1,0 +1,10 @@
+[package]
+name = "scorer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+llama-cpp-2 = "0.1"
+hf-hub = "0.5"
+tokenizers = "0.21"

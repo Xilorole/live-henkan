@@ -2,10 +2,12 @@
 //!
 //! Uses ratatui + crossterm to render a simple UI showing:
 //! - Committed text (green)
-//! - Live conversion result (yellow, underlined)
+//! - Live conversion result (yellow, underlined) with segment highlighting
 //! - Pending romaji (dim)
+//! - Candidate selection popup when in selection mode
 //!
 //! Press Escape or Ctrl-C to quit, Enter to commit, Backspace to delete.
+//! Space enters candidate selection mode; arrow keys navigate.
 
 use std::io;
 use std::path::PathBuf;
@@ -16,9 +18,9 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use dictionary::{ConnectionCost, Dictionary};
-use engine::LiveEngine;
+use engine::{EngineMode, LiveEngine};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 /// Default path to IPAdic dictionary data.
 const DEFAULT_DICT_DIR: &str = "data/dictionary/mecab-ipadic-2.7.0-20070801";
@@ -54,6 +56,19 @@ fn main() -> io::Result<()> {
 
     let mut engine = LiveEngine::new(dict, conn);
 
+    // Try loading neural LM scorer (downloads jinen model on first run)
+    eprintln!("Loading neural LM scorer...");
+    match scorer::LMScorer::load_default() {
+        Ok(lm) => {
+            engine.set_scorer(lm);
+            eprintln!("Neural LM scorer loaded. Re-ranking enabled.");
+        }
+        Err(e) => {
+            eprintln!("Neural LM scorer not available: {e}");
+            eprintln!("Continuing with Viterbi-only conversion.");
+        }
+    }
+
     // Setup terminal
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
@@ -82,6 +97,10 @@ struct AppState {
     pending: String,
     /// Status message.
     status: String,
+    /// Candidate surface strings for display (only in selection mode).
+    candidates: Vec<String>,
+    /// Index of the highlighted candidate.
+    selected_candidate: usize,
 }
 
 fn run_app(
@@ -92,11 +111,13 @@ fn run_app(
         committed_text: String::new(),
         composing: String::new(),
         pending: String::new(),
-        status: "Type romaji to convert. Enter=commit, Esc=quit".into(),
+        status: "Type romaji to convert. Enter=commit, Space=candidates, Esc=quit".into(),
+        candidates: Vec::new(),
+        selected_candidate: 0,
     };
 
     loop {
-        terminal.draw(|frame| draw(frame, &state))?;
+        terminal.draw(|frame| draw(frame, &state, engine))?;
 
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
@@ -104,17 +125,85 @@ fn run_app(
             }
 
             match key.code {
-                KeyCode::Esc => break,
+                KeyCode::Esc => {
+                    if *engine.mode() == EngineMode::Selecting {
+                        engine.cancel_selection();
+                        sync_state(&mut state, engine);
+                    } else {
+                        break;
+                    }
+                }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                 KeyCode::Enter => {
-                    let committed = engine.commit();
-                    state.committed_text.push_str(&committed);
-                    state.composing.clear();
-                    state.pending.clear();
-                    state.status = format!("Committed: {committed}");
+                    if *engine.mode() == EngineMode::Selecting {
+                        let committed = engine.confirm_selection();
+                        state.committed_text.push_str(&committed);
+                        state.composing.clear();
+                        state.pending.clear();
+                        state.candidates.clear();
+                        state.status = format!("Committed: {committed}");
+                    } else {
+                        let committed = engine.commit();
+                        state.committed_text.push_str(&committed);
+                        state.composing.clear();
+                        state.pending.clear();
+                        state.status = format!("Committed: {committed}");
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if *engine.mode() == EngineMode::Selecting {
+                        // Already selecting → next candidate
+                        engine.next_candidate();
+                        sync_state(&mut state, engine);
+                    } else if !state.composing.is_empty() {
+                        // Enter selection mode
+                        if engine.enter_selection() {
+                            sync_state(&mut state, engine);
+                            state.status =
+                                "Space/\u{2193}=next  \u{2191}=prev  \u{2190}\u{2192}=segment  Shift+\u{2190}\u{2192}=resize  Enter=confirm  Esc=cancel".into();
+                        }
+                    } else {
+                        // No composing text → insert space
+                        state.committed_text.push(' ');
+                    }
+                }
+                KeyCode::Down => {
+                    if *engine.mode() == EngineMode::Selecting {
+                        engine.next_candidate();
+                        sync_state(&mut state, engine);
+                    }
+                }
+                KeyCode::Up => {
+                    if *engine.mode() == EngineMode::Selecting {
+                        engine.prev_candidate();
+                        sync_state(&mut state, engine);
+                    }
+                }
+                KeyCode::Right => {
+                    if *engine.mode() == EngineMode::Selecting {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            engine.extend_segment();
+                        } else {
+                            engine.next_segment();
+                        }
+                        sync_state(&mut state, engine);
+                    }
+                }
+                KeyCode::Left => {
+                    if *engine.mode() == EngineMode::Selecting {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            engine.shrink_segment();
+                        } else {
+                            engine.prev_segment();
+                        }
+                        sync_state(&mut state, engine);
+                    }
                 }
                 KeyCode::Backspace => {
-                    if !state.composing.is_empty() || !state.pending.is_empty() {
+                    if *engine.mode() == EngineMode::Selecting {
+                        engine.cancel_selection();
+                        sync_state(&mut state, engine);
+                    } else if !state.composing.is_empty() || !state.pending.is_empty() {
                         let output = engine.backspace();
                         state.composing = output.composing;
                         state.pending = output.raw_pending;
@@ -136,6 +225,7 @@ fn run_app(
                     }
                     state.composing = output.composing;
                     state.pending = output.raw_pending;
+                    state.candidates.clear();
                     state.status = format!(
                         "hiragana: {} | pending: {}",
                         engine.hiragana_buffer(),
@@ -144,20 +234,26 @@ fn run_app(
                 }
                 KeyCode::Char(ch) => {
                     // Non-alphabetic: commit current + map punctuation
-                    let committed = engine.commit();
-                    state.committed_text.push_str(&committed);
+                    if *engine.mode() == EngineMode::Selecting {
+                        let committed = engine.confirm_selection();
+                        state.committed_text.push_str(&committed);
+                    } else {
+                        let committed = engine.commit();
+                        state.committed_text.push_str(&committed);
+                    }
                     let mapped = match ch {
-                        '.' => '。',
-                        ',' => '、',
-                        '!' => '！',
-                        '?' => '？',
-                        '(' => '（',
-                        ')' => '）',
+                        '.' => '\u{3002}',
+                        ',' => '\u{3001}',
+                        '!' => '\u{FF01}',
+                        '?' => '\u{FF1F}',
+                        '(' => '\u{FF08}',
+                        ')' => '\u{FF09}',
                         _ => ch,
                     };
                     state.committed_text.push(mapped);
                     state.composing.clear();
                     state.pending.clear();
+                    state.candidates.clear();
                 }
                 _ => {}
             }
@@ -167,7 +263,19 @@ fn run_app(
     Ok(())
 }
 
-fn draw(frame: &mut Frame, state: &AppState) {
+/// Sync TUI state from engine after a selection-mode operation.
+fn sync_state(state: &mut AppState, engine: &LiveEngine) {
+    let segs = engine.display_segments();
+    state.composing = segs.iter().map(|s| s.surface.as_str()).collect();
+    state.pending = String::new();
+
+    // Update candidate list
+    let candidates = engine.current_candidates();
+    state.candidates = candidates.iter().map(|c| c.surface.clone()).collect();
+    state.selected_candidate = engine.active_candidate_index();
+}
+
+fn draw(frame: &mut Frame, state: &AppState, engine: &LiveEngine) {
     let area = frame.area();
 
     let layout = Layout::default()
@@ -189,7 +297,7 @@ fn draw(frame: &mut Frame, state: &AppState) {
         .block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(title, layout[0]);
 
-    // Main display: committed + composing + pending
+    // Main display: committed + composing (with segment highlighting) + pending
     let mut spans = Vec::new();
 
     if !state.committed_text.is_empty() {
@@ -199,7 +307,25 @@ fn draw(frame: &mut Frame, state: &AppState) {
         ));
     }
 
-    if !state.composing.is_empty() {
+    let in_selection = *engine.mode() == EngineMode::Selecting;
+    let display_segs = engine.display_segments();
+
+    if in_selection && !display_segs.is_empty() {
+        // Show each segment separately, highlight the active one
+        for seg in &display_segs {
+            let style = if seg.is_active {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::UNDERLINED)
+            };
+            spans.push(Span::styled(&seg.surface, style));
+        }
+    } else if !state.composing.is_empty() {
         spans.push(Span::styled(
             &state.composing,
             Style::default()
@@ -228,6 +354,43 @@ fn draw(frame: &mut Frame, state: &AppState) {
     let input_area =
         Paragraph::new(input_line).block(Block::default().borders(Borders::ALL).title("Input"));
     frame.render_widget(input_area, layout[1]);
+
+    // Candidate popup (drawn on top of input area when in selection mode)
+    if in_selection && !state.candidates.is_empty() {
+        let max_display = 10.min(state.candidates.len());
+        let items: Vec<ListItem> = state
+            .candidates
+            .iter()
+            .enumerate()
+            .take(max_display)
+            .map(|(i, surface)| {
+                let marker = if i == state.selected_candidate {
+                    "▸ "
+                } else {
+                    "  "
+                };
+                let style = if i == state.selected_candidate {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(format!("{marker}{i}. {surface}")).style(style)
+            })
+            .collect();
+
+        // Position popup below the input area
+        let popup_height = (max_display as u16 + 2).min(area.height.saturating_sub(4));
+        let popup_width = 30.min(area.width.saturating_sub(4));
+        let popup_area = Rect::new(layout[1].x + 1, layout[1].y + 2, popup_width, popup_height);
+
+        let candidate_list =
+            List::new(items).block(Block::default().borders(Borders::ALL).title("Candidates"));
+
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(candidate_list, popup_area);
+    }
 
     // Status bar
     let status = Paragraph::new(state.status.as_str())

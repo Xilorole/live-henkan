@@ -91,7 +91,35 @@ IPAdicのCSVを直接パースする。後者のほうが依存が軽い。
 
 ---
 
-## Layer 4: Windows TSF
+## Layer 4: Neural LM Inference
+
+### Candidates
+
+| Crate | Downloads | Last Update | API | Verdict |
+|-------|-----------|-------------|-----|---------|
+| `llama-cpp-2` | 高 | Active | llama.cpp bindings, GGUF load | **ADOPT** |
+| `candle-core`+`candle-nn` | 高 | Active (HuggingFace) | Tensor ops + nn modules | ~~Evaluated~~ Requires hand-written Transformer |
+| `ort` (ONNX Runtime) | 中 | Active | ONNX model loading | C++ dependency, heavy |
+| `tch-rs` (LibTorch) | 中 | Active | PyTorch bindings | C++ dependency, 2GB+ |
+
+### Decision: `llama-cpp-2` + jinen model (from karukan project)
+
+Initially implemented with `candle` (hand-written Transformer, ~200 lines).
+Replaced with `llama-cpp-2` for the following reasons:
+
+1. **Reuse-first**: jinen (GPT-2 26M params, trained on Japanese) is publicly available
+   on HuggingFace. No need to train our own model.
+2. **No hand-written Transformer**: candle approach required implementing
+   CausalSelfAttention, TransformerBlock, etc. — bug-prone and hard to test.
+3. **Quality**: 26M param pre-trained model >> 2M param model we'd train ourselves.
+4. **llama.cpp maturity**: Battle-tested inference engine with extensive optimization.
+
+Trade-off: `llama-cpp-2` depends on llama.cpp (C++ via cmake). This adds build
+complexity but is well-supported on all platforms (Linux, macOS, Windows).
+
+---
+
+## Layer 5: Windows TSF
 
 ### 参考実装
 

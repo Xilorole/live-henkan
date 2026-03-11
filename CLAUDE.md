@@ -14,11 +14,11 @@ without requiring the user to press a conversion key — similar to macOS's
 │  Platform Layer (tsf-frontend / tui-prototype)  │
 ├─────────────────────────────────────────────────┤
 │  Engine (engine crate) — orchestrates below     │
-├──────────┬──────────────┬───────────────────────┤
-│  romaji  │  dictionary  │  converter            │
-│ (wana_kana│ (IPAdic CSV) │ (lattice + viterbi)  │
-│  wrapper) │              │                       │
-└──────────┴──────────────┴───────────────────────┘
+├──────────┬──────────────┬──────────┬────────────┤
+│  romaji  │  dictionary  │ converter│  scorer     │
+│(wana_kana│ (IPAdic CSV) │ (lattice │ (neural LM  │
+│ wrapper) │              │+ viterbi)│ re-ranking) │
+└──────────┴──────────────┴──────────┴────────────┘
 ```
 
 ### Crate Responsibilities
@@ -26,9 +26,10 @@ without requiring the user to press a conversion key — similar to macOS's
 | Crate | Purpose | Key Types | External Deps |
 |-------|---------|-----------|---------------|
 | `romaji` | Romaji → Hiragana (incremental) | `IncrementalRomaji`, `RomajiOutput` | `wana_kana` |
-| `dictionary` | IPAdic loading & reading-based lookup | `Dictionary`, `DictEntry`, `ConnectionCost` | — |
-| `converter` | Lattice construction + Viterbi | `Lattice`, `Segment` | `dictionary` |
-| `engine` | Integrates above into live conversion | `LiveEngine`, `EngineOutput` | — |
+| `dictionary` | IPAdic loading & reading-based lookup | `Dictionary`, `DictEntry`, `ConnectionCost` | `encoding_rs` |
+| `converter` | Lattice construction + Viterbi + N-best | `Lattice`, `Segment` | `dictionary` |
+| `scorer` | Neural LM inference for re-ranking | `LMScorer`, `ScorerError` | `llama-cpp-2`, `hf-hub`, `tokenizers` |
+| `engine` | Integrates above into live conversion | `LiveEngine`, `EngineOutput` | all above |
 | `tui-prototype` | TUI for development/testing | (binary) | `ratatui`, `crossterm` |
 | `tsf-frontend` | Windows TSF IME frontend | (binary, future) | `windows-rs` |
 
@@ -50,6 +51,8 @@ Current decisions (see `docs/CRATE-SURVEY.md` for full rationale):
 | Romaji → Hiragana | **Use `wana_kana`** | 1000 words/ms, well-tested, handles all edge cases |
 | Dictionary parsing | **Self-implement** | Need reading→surface reverse index (not what lindera/vibrato provide) |
 | Lattice + Viterbi | **Self-implement** | Core algorithm, kana→kanji direction differs from standard tokenizers |
+| N-best re-ranking | **Self-implement + `llama-cpp-2`** | Lattice N-best + jinen LM scoring via llama.cpp |
+| Neural LM inference | **Use `llama-cpp-2` + jinen model** | Pre-trained 26M param GPT-2, GGUF format, auto-downloaded from HF |
 | Connection costs | **Use IPAdic matrix.def** | Standard format, just parse it |
 | TUI | **Use `ratatui` + `crossterm`** | De facto standard |
 | Windows TSF | **Use `windows-rs`** | Official Microsoft crate; reference `ime-rs` and `windows-chewing-tsf` |
@@ -118,8 +121,45 @@ Connection cost matrix (`matrix.def`) is also downloaded.
 - **IPAdic for dictionary data**: Standard, freely available, includes connection costs
 - **Reading-indexed lookup**: Custom reverse index (reading → surface) for kana→kanji
 - **Lattice + Viterbi for conversion**: Standard approach; unigram first, bigram later
+- **N-best + Neural LM re-ranking**: Viterbi generates top-K paths, jinen LM
+  (GPT-2 26M, via llama.cpp) re-ranks by perplexity. Uses pre-trained model
+  from karukan project — no training pipeline needed.
+- **llama-cpp-2 for inference**: llama.cpp bindings, GGUF format, auto-downloads from HuggingFace
 - **Workspace separation**: Each crate is independently testable, easy to scope for AI agents
 - **TUI first**: Validate conversion quality before investing in platform IME integration
+
+### Conversion Pipeline
+
+```
+Input: ひらがな列
+  ↓
+Stage 1: Lattice construction (dictionary common prefix search)
+  ↓
+Stage 2: N-best Viterbi (top-K paths by bigram cost)
+  ↓
+Stage 3: Neural LM re-ranking (optional, when model loaded)
+  - Score each path's surface text via jinen LM (llama.cpp)
+  - Interpolate: α * LM_score + (1-α) * normalized_Viterbi_cost
+  ↓
+Output: Best path → Vec<Segment>
+```
+
+### Training Pipeline (`training/`)
+
+Retained for future custom model training. Currently not required — the
+scorer uses the pre-trained jinen model (auto-downloaded from HuggingFace).
+
+```
+Wikipedia dump → sentence extraction → character vocab
+  ↓
+Character-level Transformer LM (PyTorch)
+  - 3 layers, 256-dim, 4 heads, ~2M params
+  - Next-character prediction
+  ↓
+Export to safetensors → data/model/
+  ↓
+candle inference in scorer crate (legacy path)
+```
 
 ## Reference Projects
 

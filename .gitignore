@@ -5,6 +5,8 @@ Cargo.lock
 
 # Dictionary data (downloaded by scripts/setup-dict.sh)
 data/dictionary/
+# But keep supplemental dictionary
+!data/dictionary/supplemental.csv
 
 # IDE
 .idea/
