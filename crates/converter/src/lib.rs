@@ -62,14 +62,20 @@ pub struct Lattice {
 const UNKNOWN_WORD_COST: i32 = 30000;
 /// Special context ID for unknown words and BOS/EOS.
 const UNKNOWN_CONTEXT_ID: u16 = 0;
-/// Context ID used for hiragana passthrough edges.
+/// Left context ID for hiragana passthrough edges (incoming connections).
 ///
 /// Uses IPAdic ID 610 (動詞-自立, 連用形), which has universally low
-/// connection costs across all word types — especially from BOS and
-/// preceding nouns/verbs. This ensures passthrough edges representing
-/// particles and verb conjugation suffixes integrate naturally into
-/// the lattice's cost structure regardless of position.
-const HIRAGANA_CONTEXT_ID: u16 = 610;
+/// connection costs from preceding words (BOS, nouns, verbs). This ensures
+/// passthrough edges integrate naturally into the lattice.
+const HIRAGANA_LEFT_ID: u16 = 610;
+/// Right context ID for hiragana passthrough edges (outgoing connections).
+///
+/// Uses IPAdic ID 473 (助動詞), which has HIGH connection cost to other
+/// passthrough edges (610) at +3374, but LOW connection costs to dictionary
+/// word types (nouns ~-254, desu ~-2314, ne ~-3341). This prevents
+/// consecutive passthrough edges from chaining cheaply, while allowing
+/// passthrough → dictionary transitions to work naturally.
+const HIRAGANA_RIGHT_ID: u16 = 473;
 /// Extra cost added to katakana surface forms.
 ///
 /// When the input is hiragana, katakana surface entries (e.g. reading し → surface シ)
@@ -77,7 +83,11 @@ const HIRAGANA_CONTEXT_ID: u16 = 610;
 /// prefer hiragana/kanji surfaces.
 const KATAKANA_SURFACE_PENALTY: i32 = 20000;
 /// Maximum number of characters for multi-char hiragana passthrough edges.
-const HIRAGANA_PASSTHROUGH_MAX_CHARS: usize = 8;
+///
+/// Kept at 4 to cover common verb conjugation forms (していて, される, etc.)
+/// while preventing very long passthrough edges from beating legitimate
+/// multi-segment dictionary paths via connection-cost bonuses.
+const HIRAGANA_PASSTHROUGH_MAX_CHARS: usize = 4;
 
 /// Returns true if the string consists entirely of katakana characters.
 fn is_all_katakana(s: &str) -> bool {
@@ -96,7 +106,7 @@ fn is_all_hiragana(s: &str) -> bool {
 
 /// Cost for a hiragana passthrough edge of `n` characters.
 ///
-/// Tuned to work with `HIRAGANA_CONTEXT_ID` (610) which gives a large
+/// Tuned to work with `HIRAGANA_LEFT_ID` (610) which gives a large
 /// connection-cost bonus (typically -5000 to -7000). The word cost must be
 /// high enough that passthrough + connection bonus still loses to legitimate
 /// dictionary entries, but low enough to beat wrong kanji segmentations.
@@ -160,8 +170,8 @@ impl Lattice {
                         surface: ch_str.clone(),
                         reading: ch_str,
                         cost: hiragana_passthrough_cost(1),
-                        left_id: HIRAGANA_CONTEXT_ID,
-                        right_id: HIRAGANA_CONTEXT_ID,
+                        left_id: HIRAGANA_LEFT_ID,
+                        right_id: HIRAGANA_RIGHT_ID,
                     });
                 }
 
@@ -183,8 +193,8 @@ impl Lattice {
                         surface: substr.clone(),
                         reading: substr,
                         cost: hiragana_passthrough_cost(n),
-                        left_id: HIRAGANA_CONTEXT_ID,
-                        right_id: HIRAGANA_CONTEXT_ID,
+                        left_id: HIRAGANA_LEFT_ID,
+                        right_id: HIRAGANA_RIGHT_ID,
                     });
                 }
             } else {
@@ -361,7 +371,7 @@ pub fn candidates_for_reading(reading: &str, dict: &Dictionary) -> Vec<Segment> 
             UNKNOWN_WORD_COST
         };
         let (ctx_left, ctx_right) = if is_all_hiragana(reading) {
-            (HIRAGANA_CONTEXT_ID, HIRAGANA_CONTEXT_ID)
+            (HIRAGANA_LEFT_ID, HIRAGANA_RIGHT_ID)
         } else {
             (UNKNOWN_CONTEXT_ID, UNKNOWN_CONTEXT_ID)
         };

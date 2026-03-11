@@ -60,3 +60,56 @@ fn test_real_dict_passthrough() {
 
     eprintln!("All passthrough integration tests passed!");
 }
+
+#[test]
+fn test_debug_tenki_conversion() {
+    let dict_dir = Path::new("../../data/dictionary/mecab-ipadic-2.7.0-20070801");
+    if !dict_dir.exists() {
+        return;
+    }
+    let dict = dictionary::Dictionary::load_from_dir(dict_dir).unwrap();
+    let matrix_path = dict_dir.join("matrix.def");
+    let conn = dictionary::ConnectionCost::from_reader(io::BufReader::new(
+        std::fs::File::open(matrix_path).unwrap(),
+    ))
+    .unwrap();
+
+    // Full sentence
+    let result = converter::convert_with_conn("きょうはいいてんきですね", &dict, &conn).unwrap();
+    let combined: String = result.iter().map(|s| s.surface.as_str()).collect();
+    eprintln!("きょうはいいてんきですね -> {combined}");
+    for seg in &result {
+        eprintln!(
+            "  {:10} reading={:10} cost={:6} L={:4} R={:4}",
+            seg.surface, seg.reading, seg.cost, seg.left_id, seg.right_id
+        );
+    }
+
+    // Sub-phrases
+    for input in ["てんき", "いいてんき", "てんきですね", "いいてんきですね"]
+    {
+        let r = converter::convert_with_conn(input, &dict, &conn).unwrap();
+        let c: String = r.iter().map(|s| s.surface.as_str()).collect();
+        let segs: Vec<String> = r
+            .iter()
+            .map(|s| format!("{}({})", s.surface, s.reading))
+            .collect();
+        eprintln!("{input} -> {c} | {}", segs.join(" + "));
+    }
+
+    // Check dictionary entries for key readings
+    for reading in ["てんき", "てん", "き", "です", "ね", "いい"] {
+        let entries = dict.lookup(reading);
+        let top: Vec<String> = entries
+            .iter()
+            .take(5)
+            .map(|e| {
+                format!(
+                    "{}(c={},L={},R={})",
+                    e.surface, e.cost, e.left_id, e.right_id
+                )
+            })
+            .collect();
+        eprintln!("lookup({reading}): {}", top.join(", "));
+    }
+}
