@@ -4,6 +4,7 @@ members = [
     "crates/romaji",
     "crates/dictionary",
     "crates/converter",
+    "crates/scorer",
     "crates/engine",
     "crates/tui-prototype",
     # "crates/tsf-frontend",  # Enable when Windows TSF work begins
