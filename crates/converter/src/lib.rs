@@ -243,6 +243,53 @@ pub fn convert_with_conn_ctx(
     lattice.find_best_path(Some(conn), initial_right_id)
 }
 
+/// Retrieve candidate surface forms for a given hiragana reading.
+///
+/// Returns all dictionary entries matching the reading, plus a hiragana
+/// passthrough candidate if no exact hiragana entry exists. Results are
+/// sorted by cost (ascending) and deduplicated by surface form.
+pub fn candidates_for_reading(reading: &str, dict: &Dictionary) -> Vec<Segment> {
+    use std::collections::HashSet;
+
+    let mut candidates = Vec::new();
+
+    let entries = dict.lookup(reading);
+    for entry in entries {
+        let cost = if is_all_katakana(&entry.surface) {
+            entry.cost.saturating_add(KATAKANA_SURFACE_PENALTY)
+        } else {
+            entry.cost
+        };
+        candidates.push(Segment {
+            surface: entry.surface.clone(),
+            reading: entry.reading.clone(),
+            cost,
+            left_id: entry.left_id,
+            right_id: entry.right_id,
+        });
+    }
+
+    // Sort by cost ascending
+    candidates.sort_by_key(|c| c.cost);
+
+    // Deduplicate by surface form (keep first = lowest cost)
+    let mut seen = HashSet::new();
+    candidates.retain(|c| seen.insert(c.surface.clone()));
+
+    // Always include hiragana passthrough as a fallback
+    if !seen.contains(reading) {
+        candidates.push(Segment {
+            surface: reading.to_string(),
+            reading: reading.to_string(),
+            cost: UNKNOWN_WORD_COST,
+            left_id: UNKNOWN_CONTEXT_ID,
+            right_id: UNKNOWN_CONTEXT_ID,
+        });
+    }
+
+    candidates
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +416,53 @@ mod tests {
         let surfaces: Vec<&str> = result.iter().map(|s| s.surface.as_str()).collect();
         // Now 今日(5000) + conn(5000) + は(3000) = 13000 > 今日は(9000)
         assert_eq!(surfaces, vec!["今日は"]);
+    }
+
+    #[test]
+    fn test_candidates_for_reading_basic() {
+        let dict = test_dict();
+        let candidates = candidates_for_reading("きょう", &dict);
+        let surfaces: Vec<&str> = candidates.iter().map(|c| c.surface.as_str()).collect();
+        // Should include 今日, 京, 教 (from dict) and きょう (hiragana passthrough)
+        assert!(surfaces.contains(&"今日"));
+        assert!(surfaces.contains(&"京"));
+        assert!(surfaces.contains(&"教"));
+        assert!(surfaces.contains(&"きょう"));
+        // Sorted by cost: 今日(3000) < 教(6000) < 京(7000) < きょう(30000)
+        assert_eq!(candidates[0].surface, "今日");
+    }
+
+    #[test]
+    fn test_candidates_for_reading_unknown() {
+        let dict = test_dict();
+        let candidates = candidates_for_reading("ぬ", &dict);
+        // Not in dictionary → only hiragana passthrough
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].surface, "ぬ");
+    }
+
+    #[test]
+    fn test_candidates_for_reading_dedup() {
+        // Dict with duplicate surfaces at different costs
+        let csv = "今日,1,1,3000,名詞,一般,*,*,*,*,今日,キョウ,キョー\n\
+                   今日,2,2,5000,名詞,副詞可能,*,*,*,*,今日,キョウ,キョー\n";
+        let reader = std::io::BufReader::new(csv.as_bytes());
+        let dict = Dictionary::load_from_reader(reader).unwrap();
+        let candidates = candidates_for_reading("きょう", &dict);
+        // "今日" should appear only once (lowest cost kept)
+        let today_count = candidates.iter().filter(|c| c.surface == "今日").count();
+        assert_eq!(today_count, 1);
+        assert_eq!(candidates[0].cost, 3000);
+    }
+
+    #[test]
+    fn test_candidates_for_reading_katakana_penalty() {
+        let csv = "キョウ,1,1,2000,名詞,一般,*,*,*,*,キョウ,キョウ,キョー\n\
+                   今日,2,2,3000,名詞,一般,*,*,*,*,今日,キョウ,キョー\n";
+        let reader = std::io::BufReader::new(csv.as_bytes());
+        let dict = Dictionary::load_from_reader(reader).unwrap();
+        let candidates = candidates_for_reading("きょう", &dict);
+        // 今日(3000) should come before キョウ(2000+20000=22000)
+        assert_eq!(candidates[0].surface, "今日");
     }
 }
