@@ -3,9 +3,10 @@
 //! Processes keystroke-by-keystroke input and produces continuously
 //! updated conversion output — the core of "live conversion".
 
-use converter::{candidates_for_reading, convert_with_conn_ctx, Segment};
+use converter::{candidates_for_reading, convert_nbest, convert_with_conn_ctx, Segment};
 use dictionary::{ConnectionCost, Dictionary};
 use romaji::IncrementalRomaji;
+use scorer::LMScorer;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -58,6 +59,12 @@ pub struct LiveEngine {
     romaji: IncrementalRomaji,
     dict: Dictionary,
     conn: ConnectionCost,
+    /// Optional neural LM scorer for N-best re-ranking.
+    scorer: Option<LMScorer>,
+    /// Number of N-best paths to consider when scorer is active.
+    nbest_size: usize,
+    /// Interpolation weight for LM score (0.0 = Viterbi only, 1.0 = LM only).
+    lm_alpha: f32,
     /// Accumulated hiragana buffer (composed but not committed).
     hiragana_buf: String,
     /// Committed output so far.
@@ -88,6 +95,9 @@ impl LiveEngine {
             romaji: IncrementalRomaji::new(),
             dict,
             conn,
+            scorer: None,
+            nbest_size: 10,
+            lm_alpha: 0.7,
             hiragana_buf: String::new(),
             committed: String::new(),
             last_right_id: 0,
@@ -98,6 +108,24 @@ impl LiveEngine {
             candidate_indices: Vec::new(),
             active_segment: 0,
         }
+    }
+
+    /// Create a new engine with neural LM re-ranking.
+    pub fn with_scorer(dict: Dictionary, conn: ConnectionCost, scorer: LMScorer) -> Self {
+        Self {
+            scorer: Some(scorer),
+            ..Self::new(dict, conn)
+        }
+    }
+
+    /// Set the neural LM scorer (can be called after construction).
+    pub fn set_scorer(&mut self, scorer: LMScorer) {
+        self.scorer = Some(scorer);
+    }
+
+    /// Returns whether neural LM re-ranking is enabled.
+    pub fn has_scorer(&self) -> bool {
+        self.scorer.is_some()
     }
 
     /// Process a single key input and return the updated output.
@@ -137,12 +165,7 @@ impl LiveEngine {
             }
         }
 
-        let segments = match convert_with_conn_ctx(
-            &self.hiragana_buf,
-            &self.dict,
-            &self.conn,
-            self.last_right_id,
-        ) {
+        let segments = match self.convert_best(&self.hiragana_buf.clone(), self.last_right_id) {
             Ok(segments) => segments,
             Err(_) => {
                 return EngineOutput {
@@ -219,12 +242,7 @@ impl LiveEngine {
             // Use cached segments (preserves candidate selections)
             segments.iter().map(|s| s.surface.as_str()).collect()
         } else {
-            match convert_with_conn_ctx(
-                &self.hiragana_buf,
-                &self.dict,
-                &self.conn,
-                self.last_right_id,
-            ) {
+            match self.convert_best(&self.hiragana_buf.clone(), self.last_right_id) {
                 Ok(segments) => segments.iter().map(|s| s.surface.as_str()).collect(),
                 Err(_) => self.hiragana_buf.clone(),
             }
@@ -266,12 +284,7 @@ impl LiveEngine {
             self.cached_hiragana.clear();
             String::new()
         } else {
-            match convert_with_conn_ctx(
-                &self.hiragana_buf,
-                &self.dict,
-                &self.conn,
-                self.last_right_id,
-            ) {
+            match self.convert_best(&self.hiragana_buf.clone(), self.last_right_id) {
                 Ok(segments) => {
                     let s: String = segments.iter().map(|s| s.surface.as_str()).collect();
                     self.cached_hiragana = self.hiragana_buf.clone();
@@ -289,6 +302,48 @@ impl LiveEngine {
             committed: String::new(),
             composing,
             raw_pending: self.romaji.pending().to_string(),
+        }
+    }
+
+    /// Convert hiragana using the best available method.
+    ///
+    /// When a neural LM scorer is available, generates N-best paths from
+    /// Viterbi, re-ranks them by LM score, and returns the top result.
+    /// Otherwise falls back to standard Viterbi best path.
+    fn convert_best(
+        &self,
+        input: &str,
+        initial_right_id: u16,
+    ) -> Result<Vec<Segment>, converter::ConvertError> {
+        if let Some(ref scorer) = self.scorer {
+            // N-best + neural re-ranking
+            let nbest = convert_nbest(input, &self.dict, &self.conn, self.nbest_size)?;
+            if nbest.is_empty() {
+                return convert_with_conn_ctx(input, &self.dict, &self.conn, initial_right_id);
+            }
+
+            // Build (cost, surface_text) pairs for re-ranking
+            let paths: Vec<(i64, String)> = nbest
+                .iter()
+                .map(|(cost, segs)| {
+                    let text: String = segs.iter().map(|s| s.surface.as_str()).collect();
+                    (*cost, text)
+                })
+                .collect();
+
+            match scorer.rerank(&paths, self.lm_alpha) {
+                Ok(ranked) if !ranked.is_empty() => {
+                    let best_idx = ranked[0].1;
+                    Ok(nbest.into_iter().nth(best_idx).unwrap().1)
+                }
+                _ => {
+                    // Fallback: use Viterbi top-1
+                    Ok(nbest.into_iter().next().unwrap().1)
+                }
+            }
+        } else {
+            // No scorer: standard Viterbi
+            convert_with_conn_ctx(input, &self.dict, &self.conn, initial_right_id)
         }
     }
 
