@@ -62,6 +62,41 @@ fn test_real_dict_passthrough() {
 }
 
 #[test]
+fn test_onegai_conversion() {
+    let dict_dir = Path::new("../../data/dictionary/mecab-ipadic-2.7.0-20070801");
+    if !dict_dir.exists() {
+        return;
+    }
+    let dict = dictionary::Dictionary::load_from_dir(dict_dir).unwrap();
+    let matrix_path = dict_dir.join("matrix.def");
+    let conn = dictionary::ConnectionCost::from_reader(io::BufReader::new(
+        std::fs::File::open(matrix_path).unwrap(),
+    ))
+    .unwrap();
+
+    // Standard Viterbi
+    let result = converter::convert_with_conn("おねがい", &dict, &conn).unwrap();
+    let combined: String = result.iter().map(|s| s.surface.as_str()).collect();
+    eprintln!("Viterbi: おねがい -> {combined}");
+    for seg in &result {
+        eprintln!(
+            "  {} reading={} cost={} L={} R={}",
+            seg.surface, seg.reading, seg.cost, seg.left_id, seg.right_id
+        );
+    }
+
+    // N-best
+    let nbest = converter::convert_nbest("おねがい", &dict, &conn, 10).unwrap();
+    eprintln!("\nN-best paths:");
+    for (i, (cost, segs)) in nbest.iter().enumerate() {
+        let text: String = segs.iter().map(|s| s.surface.as_str()).collect();
+        eprintln!("  [{i}] cost={cost}: {text}");
+    }
+
+    assert!(combined.contains("願"), "Expected お願い, got: {combined}");
+}
+
+#[test]
 fn test_full_sentence_conversion() {
     let dict_dir = Path::new("../../data/dictionary/mecab-ipadic-2.7.0-20070801");
     if !dict_dir.exists() {

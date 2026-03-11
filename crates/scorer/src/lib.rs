@@ -96,6 +96,10 @@ fn load_tokenizer(path: &Path) -> Result<tokenizers::Tokenizer, ScorerError> {
     Ok(tokenizer)
 }
 
+/// Jinen special tokens for reading→surface prompt format.
+const INPUT_START_TOKEN: char = '\u{ee00}';
+const OUTPUT_START_TOKEN: char = '\u{ee01}';
+
 /// Neural LM scorer for N-best re-ranking.
 ///
 /// Wraps a llama.cpp GGUF model and scores text by negative log-likelihood
@@ -224,14 +228,111 @@ impl LMScorer {
         Ok(total_nll / n_chars as f32)
     }
 
+    /// Score a reading→surface conversion using jinen prompt format.
+    ///
+    /// This is the proper way to score with jinen: the model was trained
+    /// on `<input_start>reading_katakana<output_start>surface` sequences.
+    /// Only the surface portion's NLL is computed.
+    pub fn score_conversion(
+        &self,
+        reading_hiragana: &str,
+        surface: &str,
+    ) -> Result<f32, ScorerError> {
+        if surface.is_empty() {
+            return Ok(f32::MAX);
+        }
+
+        // Convert hiragana reading to katakana for jinen format
+        let reading_katakana: String = reading_hiragana
+            .chars()
+            .map(|c| {
+                if ('\u{3041}'..='\u{3096}').contains(&c) {
+                    char::from_u32(c as u32 + 0x60).unwrap_or(c)
+                } else {
+                    c
+                }
+            })
+            .collect();
+
+        let prompt = format!(
+            "{}{}{}",
+            INPUT_START_TOKEN, reading_katakana, OUTPUT_START_TOKEN
+        );
+        let full_text = format!("{}{}", prompt, surface);
+
+        let prompt_tokens = self.tokenize(&prompt)?;
+        let full_tokens = self.tokenize(&full_text)?;
+
+        if full_tokens.len() <= prompt_tokens.len() {
+            return Ok(f32::MAX);
+        }
+
+        let n_tokens = full_tokens.len();
+        let backend = get_backend()?;
+
+        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
+            NonZeroU32::new(self.n_ctx).expect("n_ctx must be non-zero"),
+        ));
+        let mut ctx = self
+            .model
+            .new_context(backend, ctx_params)
+            .map_err(|e| ScorerError::Inference(format!("context: {e}")))?;
+
+        let mut batch = LlamaBatch::new(n_tokens.max(512), 1);
+        batch
+            .add_sequence(&full_tokens, 0, true)
+            .map_err(|e| ScorerError::Inference(format!("batch: {e}")))?;
+
+        ctx.decode(&mut batch)
+            .map_err(|e| ScorerError::Inference(format!("decode: {e}")))?;
+
+        let vocab_size = self.model.n_vocab() as usize;
+
+        // Only score the surface portion (after the prompt)
+        let start_pos = prompt_tokens.len() - 1;
+        let end_pos = n_tokens - 1;
+        let mut total_nll: f32 = 0.0;
+        let mut n_scored = 0;
+
+        for pos in start_pos..end_pos {
+            let logits = ctx.get_logits_ith(pos as i32);
+
+            let max_logit = logits
+                .iter()
+                .take(vocab_size)
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let log_sum_exp: f32 = logits
+                .iter()
+                .take(vocab_size)
+                .map(|&x| (x - max_logit).exp())
+                .sum::<f32>()
+                .ln()
+                + max_logit;
+
+            let target = full_tokens[pos + 1].0 as usize;
+            if target < vocab_size {
+                total_nll -= logits[target] - log_sum_exp;
+            }
+            n_scored += 1;
+        }
+
+        if n_scored == 0 {
+            return Ok(f32::MAX);
+        }
+
+        let n_chars = surface.chars().count().max(1);
+        Ok(total_nll / n_chars as f32)
+    }
+
     /// Re-rank N-best paths by neural LM score.
     ///
-    /// Takes paths as `(viterbi_cost, surface_text)` pairs and returns them
-    /// sorted by combined score (best first). The `alpha` parameter controls
-    /// interpolation: `final = alpha * lm_score + (1-alpha) * normalized_viterbi`.
+    /// Takes paths as `(viterbi_cost, reading_hiragana, surface_text)` triples
+    /// and returns them sorted by combined score (best first). Uses jinen's
+    /// prompt format for proper conditional scoring.
     pub fn rerank(
         &self,
-        paths: &[(i64, String)],
+        paths: &[(i64, String, String)],
         alpha: f32,
     ) -> Result<Vec<(f32, usize)>, ScorerError> {
         if paths.is_empty() {
@@ -239,13 +340,13 @@ impl LMScorer {
         }
 
         // Normalize Viterbi costs to [0, 1] range
-        let min_cost = paths.iter().map(|(c, _)| *c).min().unwrap() as f32;
-        let max_cost = paths.iter().map(|(c, _)| *c).max().unwrap() as f32;
+        let min_cost = paths.iter().map(|(c, _, _)| *c).min().unwrap() as f32;
+        let max_cost = paths.iter().map(|(c, _, _)| *c).max().unwrap() as f32;
         let cost_range = (max_cost - min_cost).max(1.0);
 
         let mut scored: Vec<(f32, usize)> = Vec::with_capacity(paths.len());
-        for (i, (cost, text)) in paths.iter().enumerate() {
-            let lm_score = self.score(text)?;
+        for (i, (cost, reading, surface)) in paths.iter().enumerate() {
+            let lm_score = self.score_conversion(reading, surface)?;
             let norm_cost = (*cost as f32 - min_cost) / cost_range;
             let final_score = alpha * lm_score + (1.0 - alpha) * norm_cost;
             scored.push((final_score, i));

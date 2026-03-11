@@ -322,12 +322,13 @@ impl LiveEngine {
                 return convert_with_conn_ctx(input, &self.dict, &self.conn, initial_right_id);
             }
 
-            // Build (cost, surface_text) pairs for re-ranking
-            let paths: Vec<(i64, String)> = nbest
+            // Build (cost, reading, surface_text) triples for re-ranking
+            let paths: Vec<(i64, String, String)> = nbest
                 .iter()
                 .map(|(cost, segs)| {
-                    let text: String = segs.iter().map(|s| s.surface.as_str()).collect();
-                    (*cost, text)
+                    let reading: String = segs.iter().map(|s| s.reading.as_str()).collect();
+                    let surface: String = segs.iter().map(|s| s.surface.as_str()).collect();
+                    (*cost, reading, surface)
                 })
                 .collect();
 
