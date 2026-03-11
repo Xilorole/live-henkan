@@ -32,7 +32,7 @@ rustup default stable
 cargo install just  # optional, for task runner
 
 # Clone and setup
-git clone https://github.com/<your-username>/live-henkan.git
+git clone https://github.com/Xlorole/live-henkan.git
 cd live-henkan
 
 # Download dictionary data
