@@ -5,8 +5,6 @@ edition.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-candle-core = "0.8"
-candle-nn = "0.8"
-safetensors = "0.4"
+llama-cpp-2 = "0.1"
+hf-hub = "0.5"
+tokenizers = "0.21"

@@ -1,30 +1,36 @@
 //! Neural language model scorer for kana-kanji re-ranking.
 //!
-//! Loads a character-level Transformer LM (trained in Python, exported as
-//! safetensors) and scores candidate strings by perplexity. Lower perplexity
-//! means more natural Japanese text.
+//! Uses [llama.cpp](https://github.com/ggerganov/llama.cpp) via `llama-cpp-2`
+//! to load a pre-trained Japanese language model (GGUF format) and score
+//! candidate strings by perplexity. Lower perplexity = more natural text.
 //!
-//! # Architecture
+//! # Model
 //!
-//! The model is a small causal Transformer (GPT-like):
-//! - Character-level tokenization (Unicode codepoints)
-//! - 3 layers, 256-dim, 4 heads (~2M params)
-//! - Trained on next-character prediction over Japanese Wikipedia
+//! Uses the [jinen](https://huggingface.co/togatogah/jinen-v1-xsmall.gguf)
+//! model family from the karukan project — a GPT-2 based character-level LM
+//! trained on Japanese text. The model is automatically downloaded from
+//! HuggingFace Hub on first use (~20MB).
 //!
 //! # Usage
 //!
 //! ```ignore
-//! let scorer = LMScorer::load("data/model/")?;
-//! let score = scorer.score("今日はいい天気ですね");
+//! let scorer = LMScorer::load_default()?;
+//! let score = scorer.score("今日はいい天気ですね")?;
 //! // Lower score = more natural
 //! ```
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{embedding, layer_norm, linear, Activation, Module, VarBuilder};
-use serde::Deserialize;
+use hf_hub::api::sync::ApiBuilder;
+use hf_hub::{Repo, RepoType};
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::token::LlamaToken;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -33,260 +39,115 @@ pub enum ScorerError {
     Load(String),
     #[error("Inference error: {0}")]
     Inference(String),
+    #[error("Download error: {0}")]
+    Download(String),
+    #[error("Tokenizer error: {0}")]
+    Tokenizer(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Candle error: {0}")]
-    Candle(#[from] candle_core::Error),
 }
 
-/// Model configuration (matches training/model.py LMConfig).
-#[derive(Debug, Deserialize, Clone)]
-pub struct LMConfig {
-    pub vocab_size: usize,
-    pub d_model: usize,
-    pub n_head: usize,
-    pub n_layer: usize,
-    pub d_ff: usize,
-    pub max_seq_len: usize,
-    #[serde(default = "default_dropout")]
-    pub dropout: f64,
-}
+/// Default HuggingFace repository for the jinen xsmall model.
+const DEFAULT_REPO_ID: &str = "togatogah/jinen-v1-xsmall.gguf";
+/// Default GGUF filename (Q5_K_M quantization, ~20MB).
+const DEFAULT_GGUF_FILENAME: &str = "jinen-v1-xsmall-Q5_K_M.gguf";
+/// Default context window size.
+const DEFAULT_N_CTX: u32 = 256;
 
-fn default_dropout() -> f64 {
-    0.0
-}
+/// Global llama.cpp backend (can only be initialized once).
+static LLAMA_BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
 
-/// Character-level vocabulary.
-#[derive(Debug)]
-pub struct CharVocab {
-    char_to_id: HashMap<char, u32>,
-    #[allow(dead_code)]
-    pad_id: u32,
-    unk_id: u32,
-    bos_id: u32,
-    eos_id: u32,
-}
-
-impl CharVocab {
-    /// Load vocabulary from a text file (one character per line).
-    pub fn load(path: &Path) -> Result<Self, ScorerError> {
-        let content = std::fs::read_to_string(path)?;
-        let mut char_to_id = HashMap::new();
-        for (i, line) in content.lines().enumerate() {
-            let ch = line.chars().next();
-            if let Some(c) = ch {
-                char_to_id.insert(c, i as u32);
-            }
-        }
-        // Special token IDs (must match training/model.py)
-        Ok(Self {
-            char_to_id,
-            pad_id: 0,
-            unk_id: 1,
-            bos_id: 2,
-            eos_id: 3,
-        })
-    }
-
-    /// Encode a string to token IDs with BOS/EOS.
-    pub fn encode(&self, text: &str) -> Vec<u32> {
-        let mut ids = vec![self.bos_id];
-        for c in text.chars() {
-            ids.push(*self.char_to_id.get(&c).unwrap_or(&self.unk_id));
-        }
-        ids.push(self.eos_id);
-        ids
+fn get_backend() -> Result<&'static LlamaBackend, ScorerError> {
+    let result = LLAMA_BACKEND.get_or_init(|| {
+        let mut backend = LlamaBackend::init().map_err(|e| e.to_string())?;
+        backend.void_logs();
+        Ok(backend)
+    });
+    match result {
+        Ok(backend) => Ok(backend),
+        Err(e) => Err(ScorerError::Load(format!(
+            "Failed to initialize llama.cpp backend: {e}"
+        ))),
     }
 }
 
-/// Causal self-attention layer.
-struct CausalSelfAttention {
-    qkv: candle_nn::Linear,
-    proj: candle_nn::Linear,
-    n_head: usize,
-    d_head: usize,
+/// Download a file from HuggingFace Hub, caching locally.
+fn download_hf_file(repo_id: &str, filename: &str) -> Result<PathBuf, ScorerError> {
+    let mut builder = ApiBuilder::new();
+    if let Ok(token) = std::env::var("HF_TOKEN") {
+        builder = builder.with_token(Some(token));
+    }
+    let api = builder
+        .build()
+        .map_err(|e| ScorerError::Download(format!("HF API init: {e}")))?;
+    let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
+    let path = repo
+        .get(filename)
+        .map_err(|e| ScorerError::Download(format!("{repo_id}/{filename}: {e}")))?;
+    Ok(path)
 }
 
-impl CausalSelfAttention {
-    fn load(vb: VarBuilder, config: &LMConfig) -> Result<Self, candle_core::Error> {
-        let d_head = config.d_model / config.n_head;
-        Ok(Self {
-            qkv: linear(config.d_model, 3 * config.d_model, vb.pp("qkv"))?,
-            proj: linear(config.d_model, config.d_model, vb.pp("proj"))?,
-            n_head: config.n_head,
-            d_head,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor, candle_core::Error> {
-        let (b, t, c) = x.dims3()?;
-        let qkv = self.qkv.forward(x)?;
-        let q = qkv.narrow(2, 0, c)?;
-        let k = qkv.narrow(2, c, c)?;
-        let v = qkv.narrow(2, 2 * c, c)?;
-
-        let q = q
-            .reshape((b, t, self.n_head, self.d_head))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b, t, self.n_head, self.d_head))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b, t, self.n_head, self.d_head))?
-            .transpose(1, 2)?;
-
-        let scale = (self.d_head as f64).sqrt();
-        let att = (q.matmul(&k.transpose(2, 3)?)? / scale)?;
-
-        // Causal mask
-        let mask = Tensor::new(
-            (0..t as u32)
-                .flat_map(|i| {
-                    (0..t as u32).map(move |j| if j <= i { 0f32 } else { f32::NEG_INFINITY })
-                })
-                .collect::<Vec<_>>(),
-            x.device(),
-        )?
-        .reshape((1, 1, t, t))?;
-
-        let att = (att + mask)?;
-        let att = candle_nn::ops::softmax(&att, candle_core::D::Minus1)?;
-        let y = att.matmul(&v)?;
-        let y = y.transpose(1, 2)?.reshape((b, t, c))?;
-        self.proj.forward(&y)
-    }
-}
-
-/// Transformer block (attention + feed-forward).
-struct TransformerBlock {
-    ln1: candle_nn::LayerNorm,
-    attn: CausalSelfAttention,
-    ln2: candle_nn::LayerNorm,
-    ff1: candle_nn::Linear,
-    ff2: candle_nn::Linear,
-}
-
-impl TransformerBlock {
-    fn load(vb: VarBuilder, config: &LMConfig) -> Result<Self, candle_core::Error> {
-        Ok(Self {
-            ln1: layer_norm(
-                config.d_model,
-                candle_nn::LayerNormConfig::default(),
-                vb.pp("ln1"),
-            )?,
-            attn: CausalSelfAttention::load(vb.pp("attn"), config)?,
-            ln2: layer_norm(
-                config.d_model,
-                candle_nn::LayerNormConfig::default(),
-                vb.pp("ln2"),
-            )?,
-            ff1: linear(config.d_model, config.d_ff, vb.pp("ff").pp("0"))?,
-            ff2: linear(config.d_ff, config.d_model, vb.pp("ff").pp("2"))?,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor, candle_core::Error> {
-        let residual = x;
-        let x = self.ln1.forward(x)?;
-        let x = self.attn.forward(&x)?;
-        let x = (residual + x)?;
-
-        let residual = &x;
-        let h = self.ln2.forward(&x)?;
-        let h = self.ff1.forward(&h)?;
-        let h = h.apply(&Activation::Gelu)?;
-        let h = self.ff2.forward(&h)?;
-        residual + h
-    }
-}
-
-/// Character-level causal language model.
-struct CharLMModel {
-    tok_emb: candle_nn::Embedding,
-    pos_emb: candle_nn::Embedding,
-    blocks: Vec<TransformerBlock>,
-    ln_f: candle_nn::LayerNorm,
-    head: candle_nn::Linear,
-}
-
-impl CharLMModel {
-    fn load(vb: VarBuilder, config: &LMConfig) -> Result<Self, candle_core::Error> {
-        let tok_emb = embedding(config.vocab_size, config.d_model, vb.pp("tok_emb"))?;
-        let pos_emb = embedding(config.max_seq_len, config.d_model, vb.pp("pos_emb"))?;
-        let mut blocks = Vec::new();
-        for i in 0..config.n_layer {
-            blocks.push(TransformerBlock::load(
-                vb.pp(format!("blocks.{i}")),
-                config,
-            )?);
-        }
-        let ln_f = layer_norm(
-            config.d_model,
-            candle_nn::LayerNormConfig::default(),
-            vb.pp("ln_f"),
-        )?;
-        let head = linear(config.d_model, config.vocab_size, vb.pp("head"))?;
-        Ok(Self {
-            tok_emb,
-            pos_emb,
-            blocks,
-            ln_f,
-            head,
-        })
-    }
-
-    fn forward(&self, idx: &Tensor) -> Result<Tensor, candle_core::Error> {
-        let (_b, t) = idx.dims2()?;
-        let tok = self.tok_emb.forward(idx)?;
-        let positions = Tensor::arange(0u32, t as u32, idx.device())?;
-        let pos = self.pos_emb.forward(&positions)?;
-        let mut x = (tok + pos.unsqueeze(0)?)?;
-        for block in &self.blocks {
-            x = block.forward(&x)?;
-        }
-        let x = self.ln_f.forward(&x)?;
-        self.head.forward(&x)
-    }
+/// Load an external HuggingFace tokenizer from `tokenizer.json`.
+fn load_tokenizer(path: &Path) -> Result<tokenizers::Tokenizer, ScorerError> {
+    let mut tokenizer = tokenizers::Tokenizer::from_file(path)
+        .map_err(|e| ScorerError::Tokenizer(format!("{e}")))?;
+    tokenizer.with_padding(None);
+    tokenizer.with_truncation(None).ok();
+    Ok(tokenizer)
 }
 
 /// Neural LM scorer for N-best re-ranking.
 ///
-/// Loads a pre-trained character-level Transformer and scores text strings
-/// by negative log-likelihood per character. Lower score = more natural.
+/// Wraps a llama.cpp GGUF model and scores text by negative log-likelihood
+/// per character. Lower score = more natural Japanese text.
 pub struct LMScorer {
-    model: CharLMModel,
-    vocab: CharVocab,
-    device: Device,
+    model: LlamaModel,
+    tokenizer: tokenizers::Tokenizer,
+    n_ctx: u32,
 }
 
 impl LMScorer {
-    /// Load model from a directory containing `model.safetensors`, `config.json`, `vocab.txt`.
-    pub fn load(model_dir: &Path) -> Result<Self, ScorerError> {
-        let device = Device::Cpu;
+    /// Load model from explicit local file paths.
+    pub fn load(model_path: &Path, tokenizer_path: &Path) -> Result<Self, ScorerError> {
+        let backend = get_backend()?;
 
-        // Load config
-        let config_path = model_dir.join("config.json");
-        let config_str = std::fs::read_to_string(&config_path)
-            .map_err(|e| ScorerError::Load(format!("config.json: {e}")))?;
-        let config: LMConfig = serde_json::from_str(&config_str)
-            .map_err(|e| ScorerError::Load(format!("config parse: {e}")))?;
+        // GPT-2 has Metal issues on macOS, use CPU only
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(0);
+        let model = LlamaModel::load_from_file(backend, model_path, &model_params)
+            .map_err(|e| ScorerError::Load(format!("GGUF load: {e}")))?;
 
-        // Load vocab
-        let vocab = CharVocab::load(&model_dir.join("vocab.txt"))?;
-
-        // Load weights
-        let weights_path = model_dir.join("model.safetensors");
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)
-                .map_err(|e| ScorerError::Load(format!("weights load: {e}")))?
-        };
-        let model = CharLMModel::load(vb, &config)?;
+        let tokenizer = load_tokenizer(tokenizer_path)?;
 
         Ok(Self {
             model,
-            vocab,
-            device,
+            tokenizer,
+            n_ctx: DEFAULT_N_CTX,
         })
+    }
+
+    /// Load the default jinen-v1-xsmall model, downloading from HuggingFace if needed.
+    pub fn load_default() -> Result<Self, ScorerError> {
+        Self::load_from_repo(DEFAULT_REPO_ID, DEFAULT_GGUF_FILENAME)
+    }
+
+    /// Load a model from a HuggingFace repository.
+    pub fn load_from_repo(repo_id: &str, gguf_filename: &str) -> Result<Self, ScorerError> {
+        let model_path = download_hf_file(repo_id, gguf_filename)?;
+        let tokenizer_path = download_hf_file(repo_id, "tokenizer.json")?;
+        Self::load(&model_path, &tokenizer_path)
+    }
+
+    /// Tokenize text using the external tokenizer.
+    fn tokenize(&self, text: &str) -> Result<Vec<LlamaToken>, ScorerError> {
+        let encoding = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| ScorerError::Tokenizer(format!("{e}")))?;
+        Ok(encoding
+            .get_ids()
+            .iter()
+            .map(|&id| LlamaToken(id as i32))
+            .collect())
     }
 
     /// Score a text string by negative log-likelihood per character.
@@ -298,45 +159,76 @@ impl LMScorer {
             return Ok(f32::MAX);
         }
 
-        let ids = self.vocab.encode(text);
-        let ids_tensor = Tensor::new(ids.as_slice(), &self.device)?
-            .unsqueeze(0)?
-            .to_dtype(DType::U32)?;
-
-        let logits = self.model.forward(&ids_tensor)?; // (1, T, V)
-        let logits = logits.i(0)?; // (T, V)
-
-        // Compute NLL: for each position i, loss = -log P(token[i+1] | token[0..=i])
-        let seq_len = ids.len();
-        if seq_len < 2 {
+        let tokens = self.tokenize(text)?;
+        if tokens.len() < 2 {
             return Ok(f32::MAX);
         }
 
-        let logits = logits.narrow(0, 0, seq_len - 1)?; // (T-1, V)
-        let targets: Vec<u32> = ids[1..].to_vec();
-        let targets_tensor = Tensor::new(targets.as_slice(), &self.device)?;
+        let n_tokens = tokens.len();
+        let backend = get_backend()?;
 
-        let log_probs = candle_nn::ops::log_softmax(&logits, candle_core::D::Minus1)?;
+        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(
+            NonZeroU32::new(self.n_ctx).expect("n_ctx must be non-zero"),
+        ));
+        let mut ctx = self
+            .model
+            .new_context(backend, ctx_params)
+            .map_err(|e| ScorerError::Inference(format!("context: {e}")))?;
 
-        // Gather log probs for target tokens
-        let targets_expanded = targets_tensor.unsqueeze(1)?;
-        let selected = log_probs.gather(&targets_expanded, 1)?;
-        let nll = selected.squeeze(1)?.neg()?;
-        let mean_nll = nll.mean(0)?.to_scalar::<f32>()?;
+        // Feed all tokens, requesting logits at every position
+        let mut batch = LlamaBatch::new(n_tokens.max(512), 1);
+        batch
+            .add_sequence(&tokens, 0, true)
+            .map_err(|e| ScorerError::Inference(format!("batch: {e}")))?;
 
-        Ok(mean_nll)
-    }
+        ctx.decode(&mut batch)
+            .map_err(|e| ScorerError::Inference(format!("decode: {e}")))?;
 
-    /// Score multiple texts and return scores in the same order.
-    pub fn score_batch(&self, texts: &[String]) -> Result<Vec<f32>, ScorerError> {
-        texts.iter().map(|t| self.score(t)).collect()
+        let vocab_size = self.model.n_vocab() as usize;
+
+        // Compute NLL: for each position, -log P(next_token | prefix)
+        let mut total_nll: f32 = 0.0;
+        let mut n_scored = 0;
+
+        for pos in 0..(n_tokens - 1) {
+            let logits = ctx.get_logits_ith(pos as i32);
+
+            // Log-softmax: log P(token) = logit - log(sum(exp(logits)))
+            let max_logit = logits
+                .iter()
+                .take(vocab_size)
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let log_sum_exp: f32 = logits
+                .iter()
+                .take(vocab_size)
+                .map(|&x| (x - max_logit).exp())
+                .sum::<f32>()
+                .ln()
+                + max_logit;
+
+            let target = tokens[pos + 1].0 as usize;
+            if target < vocab_size {
+                total_nll -= logits[target] - log_sum_exp;
+            }
+            n_scored += 1;
+        }
+
+        if n_scored == 0 {
+            return Ok(f32::MAX);
+        }
+
+        // Normalize by character count (not token count) for fair comparison
+        // across paths with different segmentations
+        let n_chars = text.chars().count().max(1);
+        Ok(total_nll / n_chars as f32)
     }
 
     /// Re-rank N-best paths by neural LM score.
     ///
     /// Takes paths as `(viterbi_cost, surface_text)` pairs and returns them
-    /// sorted by LM score (best first). The `alpha` parameter controls the
-    /// interpolation: `final_score = alpha * lm_score + (1-alpha) * normalized_viterbi`.
+    /// sorted by combined score (best first). The `alpha` parameter controls
+    /// interpolation: `final = alpha * lm_score + (1-alpha) * normalized_viterbi`.
     pub fn rerank(
         &self,
         paths: &[(i64, String)],
@@ -369,40 +261,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_vocab_encode() {
-        // Create a minimal vocab file in memory
-        let vocab_content = "<pad>\n<unk>\n<bos>\n<eos>\na\nb\nc\n";
-        let dir = std::env::temp_dir().join("scorer_test_vocab");
-        std::fs::create_dir_all(&dir).unwrap();
-        let vocab_path = dir.join("vocab.txt");
-        std::fs::write(&vocab_path, vocab_content).unwrap();
+    fn test_scorer_error_display() {
+        let err = ScorerError::Load("test error".to_string());
+        assert_eq!(err.to_string(), "Model loading error: test error");
 
-        let vocab = CharVocab::load(&vocab_path).unwrap();
-        let ids = vocab.encode("abc");
-        // BOS=2, a=4, b=5, c=6, EOS=3
-        assert_eq!(ids, vec![2, 4, 5, 6, 3]);
+        let err = ScorerError::Download("not found".to_string());
+        assert_eq!(err.to_string(), "Download error: not found");
     }
 
     #[test]
-    fn test_vocab_unknown() {
-        let vocab_content = "<pad>\n<unk>\n<bos>\n<eos>\na\n";
-        let dir = std::env::temp_dir().join("scorer_test_unk");
-        std::fs::create_dir_all(&dir).unwrap();
-        let vocab_path = dir.join("vocab.txt");
-        std::fs::write(&vocab_path, vocab_content).unwrap();
-
-        let vocab = CharVocab::load(&vocab_path).unwrap();
-        let ids = vocab.encode("az");
-        // 'z' is unknown → UNK_ID=1
-        assert_eq!(ids, vec![2, 4, 1, 3]);
-    }
-
-    #[test]
-    fn test_config_deserialize() {
-        let json = r#"{"vocab_size":4096,"d_model":256,"n_head":4,"n_layer":3,"d_ff":512,"max_seq_len":256}"#;
-        let config: LMConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.vocab_size, 4096);
-        assert_eq!(config.d_model, 256);
-        assert_eq!(config.n_layer, 3);
+    fn test_download_hf_file_invalid_repo() {
+        let result = download_hf_file("nonexistent-user-xyz/nonexistent-repo-12345", "f.bin");
+        assert!(result.is_err());
     }
 }
