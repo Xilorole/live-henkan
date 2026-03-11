@@ -17,8 +17,10 @@
 //! The `reading` field is in katakana; we normalize to hiragana for lookup.
 
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::Path;
 
+use encoding_rs::EUC_JP;
 use thiserror::Error;
 
 /// Errors during dictionary operations.
@@ -52,7 +54,8 @@ pub struct DictEntry {
 /// `matrix[right_id_of_prev][left_id_of_next]` gives the transition cost.
 #[derive(Debug)]
 pub struct ConnectionCost {
-    /// Number of right context IDs.
+    /// Number of right context IDs (used for validation).
+    #[allow(dead_code)]
     right_size: usize,
     /// Number of left context IDs.
     left_size: usize,
@@ -68,8 +71,67 @@ impl ConnectionCost {
     }
 
     /// Parse from IPAdic `matrix.def` format.
-    pub fn from_reader(reader: impl std::io::BufRead) -> Result<Self, DictError> {
-        todo!("M2: Parse matrix.def — first line is 'right_size left_size', rest is 'right left cost'")
+    ///
+    /// First line: `right_size left_size`
+    /// Remaining lines: `right_id left_id cost`
+    pub fn from_reader(reader: impl BufRead) -> Result<Self, DictError> {
+        let mut lines = reader.lines();
+
+        let header = lines
+            .next()
+            .ok_or_else(|| DictError::Parse {
+                line: 1,
+                reason: "empty matrix.def".into(),
+            })?
+            .map_err(DictError::Io)?;
+
+        let parts: Vec<&str> = header.split_whitespace().collect();
+        if parts.len() != 2 {
+            return Err(DictError::Parse {
+                line: 1,
+                reason: format!("expected 'right_size left_size', got '{header}'"),
+            });
+        }
+        let right_size: usize = parts[0].parse().map_err(|_| DictError::Parse {
+            line: 1,
+            reason: "invalid right_size".into(),
+        })?;
+        let left_size: usize = parts[1].parse().map_err(|_| DictError::Parse {
+            line: 1,
+            reason: "invalid left_size".into(),
+        })?;
+
+        let mut costs = vec![0i16; right_size * left_size];
+
+        for (i, line_result) in lines.enumerate() {
+            let line = line_result.map_err(DictError::Io)?;
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() != 3 {
+                continue;
+            }
+            let right_id: usize = parts[0].parse().map_err(|_| DictError::Parse {
+                line: i + 2,
+                reason: "invalid right_id".into(),
+            })?;
+            let left_id: usize = parts[1].parse().map_err(|_| DictError::Parse {
+                line: i + 2,
+                reason: "invalid left_id".into(),
+            })?;
+            let cost: i16 = parts[2].parse().map_err(|_| DictError::Parse {
+                line: i + 2,
+                reason: "invalid cost".into(),
+            })?;
+
+            if right_id < right_size && left_id < left_size {
+                costs[right_id * left_size + left_id] = cost;
+            }
+        }
+
+        Ok(Self {
+            right_size,
+            left_size,
+            costs,
+        })
     }
 }
 
@@ -81,16 +143,103 @@ pub struct Dictionary {
 }
 
 impl Dictionary {
-    /// Load dictionary from a directory containing IPAdic CSV files.
+    /// Load dictionary from a directory containing IPAdic CSV files (EUC-JP encoded).
     ///
     /// Expects files like `*.csv` in IPAdic format.
     pub fn load_from_dir(dir: &Path) -> Result<Self, DictError> {
-        todo!("M2: glob *.csv, parse each, build reading index")
+        let mut all_entries: HashMap<String, Vec<DictEntry>> = HashMap::new();
+
+        let csv_files: Vec<_> = std::fs::read_dir(dir)
+            .map_err(DictError::Io)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
+            })
+            .collect();
+
+        if csv_files.is_empty() {
+            return Err(DictError::NoDictFiles(dir.display().to_string()));
+        }
+
+        for entry in &csv_files {
+            let raw_bytes = std::fs::read(entry.path()).map_err(DictError::Io)?;
+            let (utf8, _, _) = EUC_JP.decode(&raw_bytes);
+            let cursor = std::io::Cursor::new(utf8.as_bytes());
+            let reader = std::io::BufReader::new(cursor);
+            let partial = Self::load_from_reader(reader)?;
+            for (reading, entries) in partial.entries {
+                all_entries.entry(reading).or_default().extend(entries);
+            }
+        }
+
+        // Sort each entry list by cost ascending
+        for entries in all_entries.values_mut() {
+            entries.sort_by_key(|e| e.cost);
+        }
+
+        Ok(Dictionary {
+            entries: all_entries,
+        })
     }
 
-    /// Load dictionary from a single IPAdic CSV reader.
-    pub fn load_from_reader(reader: impl std::io::BufRead) -> Result<Self, DictError> {
-        todo!("M2: Parse IPAdic CSV, normalize katakana readings to hiragana, index by reading")
+    /// Load dictionary from a single IPAdic CSV reader (UTF-8).
+    ///
+    /// IPAdic CSV format: `surface,left_id,right_id,cost,pos1,pos2,pos3,pos4,conj_type,conj_form,base,reading,pronunciation`
+    pub fn load_from_reader(reader: impl BufRead) -> Result<Self, DictError> {
+        let mut entries: HashMap<String, Vec<DictEntry>> = HashMap::new();
+
+        for (i, line_result) in reader.lines().enumerate() {
+            let line = line_result.map_err(DictError::Io)?;
+            if line.is_empty() {
+                continue;
+            }
+
+            let fields: Vec<&str> = parse_csv_line(&line);
+            if fields.len() < 13 {
+                // Skip malformed lines rather than failing
+                continue;
+            }
+
+            let surface = fields[0].to_string();
+            let left_id: u16 = fields[1].parse().map_err(|_| DictError::Parse {
+                line: i + 1,
+                reason: format!("invalid left_id: '{}'", fields[1]),
+            })?;
+            let right_id: u16 = fields[2].parse().map_err(|_| DictError::Parse {
+                line: i + 1,
+                reason: format!("invalid right_id: '{}'", fields[2]),
+            })?;
+            let cost: i32 = fields[3].parse().map_err(|_| DictError::Parse {
+                line: i + 1,
+                reason: format!("invalid cost: '{}'", fields[3]),
+            })?;
+
+            let reading_katakana = fields[11];
+            let reading = katakana_to_hiragana(reading_katakana);
+
+            if reading.is_empty() {
+                continue;
+            }
+
+            let entry = DictEntry {
+                surface,
+                reading: reading.clone(),
+                left_id,
+                right_id,
+                cost,
+            };
+
+            entries.entry(reading).or_default().push(entry);
+        }
+
+        // Sort each entry list by cost ascending
+        for v in entries.values_mut() {
+            v.sort_by_key(|e| e.cost);
+        }
+
+        Ok(Dictionary { entries })
     }
 
     /// Exact match: all entries whose reading equals `reading`.
@@ -107,7 +256,19 @@ impl Dictionary {
     /// Returns `(end_byte_position, entries)` pairs, sorted by length ascending.
     /// This is the core operation for lattice construction.
     pub fn common_prefix_search(&self, input: &str, start: usize) -> Vec<(usize, &[DictEntry])> {
-        todo!("M2: iterate char boundaries from start, check each prefix in entries map")
+        let suffix = &input[start..];
+        let mut results = Vec::new();
+
+        let mut end = start;
+        for ch in suffix.chars() {
+            end += ch.len_utf8();
+            let prefix = &input[start..end];
+            if let Some(entries) = self.entries.get(prefix) {
+                results.push((end, entries.as_slice()));
+            }
+        }
+
+        results
     }
 
     /// Number of unique readings in the dictionary.
@@ -119,6 +280,36 @@ impl Dictionary {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// Parse an IPAdic CSV line, handling quoted fields.
+///
+/// IPAdic uses commas as delimiters and quotes fields containing commas.
+fn parse_csv_line(line: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let bytes = line.as_bytes();
+
+    for i in 0..bytes.len() {
+        if bytes[i] == b'"' {
+            in_quotes = !in_quotes;
+        } else if bytes[i] == b',' && !in_quotes {
+            let field = &line[start..i];
+            // Strip surrounding quotes
+            let field = field.strip_prefix('"').unwrap_or(field);
+            let field = field.strip_suffix('"').unwrap_or(field);
+            fields.push(field);
+            start = i + 1;
+        }
+    }
+    // Last field
+    let field = &line[start..];
+    let field = field.strip_prefix('"').unwrap_or(field);
+    let field = field.strip_suffix('"').unwrap_or(field);
+    fields.push(field);
+
+    fields
 }
 
 /// Convert katakana string to hiragana (for normalizing IPAdic readings).
@@ -195,5 +386,108 @@ mod tests {
         let dict = Dictionary { entries };
         assert_eq!(dict.lookup("きょう").len(), 2);
         assert_eq!(dict.lookup("きょう")[0].surface, "今日");
+    }
+
+    #[test]
+    fn test_load_from_reader_simple_csv() {
+        // IPAdic CSV line (UTF-8, 13 fields):
+        // surface,left_id,right_id,cost,pos1,pos2,pos3,pos4,conj_type,conj_form,base,reading,pronunciation
+        let csv = "今日,1,2,5000,名詞,一般,*,*,*,*,今日,キョウ,キョー\n\
+                   京,3,4,7000,名詞,固有名詞,*,*,*,*,京,キョウ,キョー\n\
+                   東京,5,6,3000,名詞,固有名詞,*,*,*,*,東京,トウキョウ,トーキョー\n";
+        let reader = std::io::BufReader::new(csv.as_bytes());
+        let dict = Dictionary::load_from_reader(reader).unwrap();
+
+        assert_eq!(dict.lookup("きょう").len(), 2);
+        // Sorted by cost: 今日(5000) before 京(7000)
+        assert_eq!(dict.lookup("きょう")[0].surface, "今日");
+        assert_eq!(dict.lookup("きょう")[1].surface, "京");
+
+        assert_eq!(dict.lookup("とうきょう").len(), 1);
+        assert_eq!(dict.lookup("とうきょう")[0].surface, "東京");
+    }
+
+    #[test]
+    fn test_common_prefix_search() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "き".into(),
+            vec![DictEntry {
+                surface: "木".into(),
+                reading: "き".into(),
+                left_id: 1,
+                right_id: 1,
+                cost: 5000,
+            }],
+        );
+        entries.insert(
+            "きょう".into(),
+            vec![DictEntry {
+                surface: "今日".into(),
+                reading: "きょう".into(),
+                left_id: 1,
+                right_id: 1,
+                cost: 3000,
+            }],
+        );
+        let dict = Dictionary { entries };
+
+        let results = dict.common_prefix_search("きょうは", 0);
+        assert_eq!(results.len(), 2);
+        // First: "き" (shortest prefix)
+        assert_eq!(results[0].1[0].surface, "木");
+        // Second: "きょう"
+        assert_eq!(results[1].1[0].surface, "今日");
+    }
+
+    #[test]
+    fn test_common_prefix_search_with_offset() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "は".into(),
+            vec![DictEntry {
+                surface: "は".into(),
+                reading: "は".into(),
+                left_id: 1,
+                right_id: 1,
+                cost: 4000,
+            }],
+        );
+        let dict = Dictionary { entries };
+
+        let input = "きょうは";
+        let start = "きょう".len();
+        let results = dict.common_prefix_search(input, start);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1[0].surface, "は");
+    }
+
+    #[test]
+    fn test_connection_cost_from_reader() {
+        let data = "3 3\n0 0 -100\n0 1 200\n1 0 50\n2 2 -300\n";
+        let reader = std::io::BufReader::new(data.as_bytes());
+        let conn = ConnectionCost::from_reader(reader).unwrap();
+
+        assert_eq!(conn.cost(0, 0), -100);
+        assert_eq!(conn.cost(0, 1), 200);
+        assert_eq!(conn.cost(1, 0), 50);
+        assert_eq!(conn.cost(2, 2), -300);
+        // Unset entries default to 0
+        assert_eq!(conn.cost(1, 1), 0);
+    }
+
+    #[test]
+    fn test_parse_csv_line_simple() {
+        let fields = parse_csv_line("今日,1,2,5000,名詞,一般,*,*,*,*,今日,キョウ,キョー");
+        assert_eq!(fields.len(), 13);
+        assert_eq!(fields[0], "今日");
+        assert_eq!(fields[11], "キョウ");
+    }
+
+    #[test]
+    fn test_parse_csv_line_quoted() {
+        let fields = parse_csv_line("\"hello, world\",1,2");
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0], "hello, world");
     }
 }
