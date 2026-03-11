@@ -1,0 +1,20 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Dictionary data (downloaded by scripts/setup-dict.sh)
+data/dictionary/*.txt
+data/dictionary/*.bin
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env

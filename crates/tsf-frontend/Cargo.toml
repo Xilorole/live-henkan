@@ -1,0 +1,15 @@
+[package]
+name = "tsf-frontend"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+engine = { path = "../engine" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_UI_TextServices",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "implement",
+] }

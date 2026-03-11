@@ -1,0 +1,9 @@
+[package]
+name = "tui-prototype"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+engine = { path = "../engine" }
+ratatui = "0.29"
+crossterm = "0.28"

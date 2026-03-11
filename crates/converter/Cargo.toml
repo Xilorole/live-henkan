@@ -1,0 +1,8 @@
+[package]
+name = "converter"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+dictionary = { path = "../dictionary" }

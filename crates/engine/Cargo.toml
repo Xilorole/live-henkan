@@ -1,0 +1,10 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+romaji = { path = "../romaji" }
+dictionary = { path = "../dictionary" }
+converter = { path = "../converter" }
