@@ -58,20 +58,50 @@ pub struct Lattice {
     input_len: usize,
 }
 
-/// Cost for unknown single-character fallback edges.
+/// Cost for unknown single-character fallback edges (non-hiragana).
 const UNKNOWN_WORD_COST: i32 = 30000;
 /// Special context ID for unknown words and BOS/EOS.
 const UNKNOWN_CONTEXT_ID: u16 = 0;
+/// Context ID used for hiragana passthrough edges.
+///
+/// Uses IPAdic ID 610 (動詞-自立, 連用形), which has universally low
+/// connection costs across all word types — especially from BOS and
+/// preceding nouns/verbs. This ensures passthrough edges representing
+/// particles and verb conjugation suffixes integrate naturally into
+/// the lattice's cost structure regardless of position.
+const HIRAGANA_CONTEXT_ID: u16 = 610;
 /// Extra cost added to katakana surface forms.
 ///
 /// When the input is hiragana, katakana surface entries (e.g. reading し → surface シ)
 /// from the dictionary are usually wrong. Penalizing them heavily makes the Viterbi
 /// prefer hiragana/kanji surfaces.
 const KATAKANA_SURFACE_PENALTY: i32 = 20000;
+/// Maximum number of characters for multi-char hiragana passthrough edges.
+const HIRAGANA_PASSTHROUGH_MAX_CHARS: usize = 8;
 
 /// Returns true if the string consists entirely of katakana characters.
 fn is_all_katakana(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| ('\u{30A0}'..='\u{30FF}').contains(&c))
+}
+
+/// Returns true if the character is hiragana.
+fn is_hiragana(c: char) -> bool {
+    ('\u{3041}'..='\u{3096}').contains(&c)
+}
+
+/// Returns true if the string consists entirely of hiragana characters.
+fn is_all_hiragana(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(is_hiragana)
+}
+
+/// Cost for a hiragana passthrough edge of `n` characters.
+///
+/// Tuned to work with `HIRAGANA_CONTEXT_ID` (610) which gives a large
+/// connection-cost bonus (typically -5000 to -7000). The word cost must be
+/// high enough that passthrough + connection bonus still loses to legitimate
+/// dictionary entries, but low enough to beat wrong kanji segmentations.
+fn hiragana_passthrough_cost(n: usize) -> i32 {
+    7000 + 500 * (n as i32 - 1)
 }
 
 impl Lattice {
@@ -112,19 +142,66 @@ impl Lattice {
                 }
             }
 
-            // Always add single-character fallback (unknown word) edge
-            // This ensures the lattice is fully connected
-            let has_single_char_match = matches.iter().any(|(end, _)| *end == pos + char_len);
-            if !has_single_char_match {
-                let ch_str: String = input[pos..pos + char_len].to_string();
-                edges[pos].push(LatticeEdge {
-                    end: pos + char_len,
-                    surface: ch_str.clone(),
-                    reading: ch_str,
-                    cost: UNKNOWN_WORD_COST,
-                    left_id: UNKNOWN_CONTEXT_ID,
-                    right_id: UNKNOWN_CONTEXT_ID,
-                });
+            if is_hiragana(ch) {
+                // Hiragana passthrough edges — allows the Viterbi to keep
+                // hiragana characters unconverted, which is essential for
+                // particles, verb conjugation suffixes, and other function
+                // words that IPAdic lacks as standalone entries.
+                let ch_str = input[pos..pos + char_len].to_string();
+
+                // Single-char passthrough (skip if dict already has this
+                // exact hiragana surface — e.g. に as 助詞)
+                let has_hiragana_surface = edges[pos]
+                    .iter()
+                    .any(|e| e.surface == ch_str && e.end == pos + char_len);
+                if !has_hiragana_surface {
+                    edges[pos].push(LatticeEdge {
+                        end: pos + char_len,
+                        surface: ch_str.clone(),
+                        reading: ch_str,
+                        cost: hiragana_passthrough_cost(1),
+                        left_id: HIRAGANA_CONTEXT_ID,
+                        right_id: HIRAGANA_CONTEXT_ID,
+                    });
+                }
+
+                // Multi-char passthrough: look ahead for consecutive hiragana.
+                // This creates edges like "して", "していて" that can compete
+                // with wrong kanji segmentations when verb conjugation forms
+                // are absent from the dictionary.
+                let mut end_byte = char_len;
+                let mut n = 1usize;
+                for next_ch in input[pos + char_len..].chars() {
+                    if !is_hiragana(next_ch) || n >= HIRAGANA_PASSTHROUGH_MAX_CHARS {
+                        break;
+                    }
+                    n += 1;
+                    end_byte += next_ch.len_utf8();
+                    let substr = input[pos..pos + end_byte].to_string();
+                    edges[pos].push(LatticeEdge {
+                        end: pos + end_byte,
+                        surface: substr.clone(),
+                        reading: substr,
+                        cost: hiragana_passthrough_cost(n),
+                        left_id: HIRAGANA_CONTEXT_ID,
+                        right_id: HIRAGANA_CONTEXT_ID,
+                    });
+                }
+            } else {
+                // Non-hiragana: add unknown word fallback if no single-char
+                // dictionary match exists.
+                let has_single_char_match = matches.iter().any(|(end, _)| *end == pos + char_len);
+                if !has_single_char_match {
+                    let ch_str: String = input[pos..pos + char_len].to_string();
+                    edges[pos].push(LatticeEdge {
+                        end: pos + char_len,
+                        surface: ch_str.clone(),
+                        reading: ch_str,
+                        cost: UNKNOWN_WORD_COST,
+                        left_id: UNKNOWN_CONTEXT_ID,
+                        right_id: UNKNOWN_CONTEXT_ID,
+                    });
+                }
             }
 
             pos += char_len;
@@ -278,12 +355,22 @@ pub fn candidates_for_reading(reading: &str, dict: &Dictionary) -> Vec<Segment> 
 
     // Always include hiragana passthrough as a fallback
     if !seen.contains(reading) {
+        let cost = if is_all_hiragana(reading) {
+            hiragana_passthrough_cost(reading.chars().count())
+        } else {
+            UNKNOWN_WORD_COST
+        };
+        let (ctx_left, ctx_right) = if is_all_hiragana(reading) {
+            (HIRAGANA_CONTEXT_ID, HIRAGANA_CONTEXT_ID)
+        } else {
+            (UNKNOWN_CONTEXT_ID, UNKNOWN_CONTEXT_ID)
+        };
         candidates.push(Segment {
             surface: reading.to_string(),
             reading: reading.to_string(),
-            cost: UNKNOWN_WORD_COST,
-            left_id: UNKNOWN_CONTEXT_ID,
-            right_id: UNKNOWN_CONTEXT_ID,
+            cost,
+            left_id: ctx_left,
+            right_id: ctx_right,
         });
     }
 
@@ -395,14 +482,15 @@ mod tests {
 
     #[test]
     fn test_connection_costs_affect_result() {
-        // Build a scenario where connection costs change the optimal path
-        let csv = "今日,1,1,5000,名詞,一般,*,*,*,*,今日,キョウ,キョー\n\
-                   は,2,2,3000,助詞,係助詞,*,*,*,*,は,ハ,ワ\n\
-                   今日は,3,3,9000,感動詞,*,*,*,*,*,今日は,キョウハ,キョーワ\n";
+        // Build a scenario where connection costs change the optimal path.
+        // Use low-cost entries so kanji path beats hiragana passthrough.
+        let csv = "今日,1,1,2000,名詞,一般,*,*,*,*,今日,キョウ,キョー\n\
+                   は,2,2,2000,助詞,係助詞,*,*,*,*,は,ハ,ワ\n\
+                   今日は,3,3,6000,感動詞,*,*,*,*,*,今日は,キョウハ,キョーワ\n";
         let reader = std::io::BufReader::new(csv.as_bytes());
         let dict = Dictionary::load_from_reader(reader).unwrap();
 
-        // Without connection costs: 今日(5000) + は(3000) = 8000 < 今日は(9000)
+        // Without connection costs: 今日(2000) + は(2000) = 4000 < 今日は(6000)
         let result = convert("きょうは", &dict).unwrap();
         let surfaces: Vec<&str> = result.iter().map(|s| s.surface.as_str()).collect();
         assert_eq!(surfaces, vec!["今日", "は"]);
@@ -414,7 +502,7 @@ mod tests {
 
         let result = convert_with_conn("きょうは", &dict, &conn).unwrap();
         let surfaces: Vec<&str> = result.iter().map(|s| s.surface.as_str()).collect();
-        // Now 今日(5000) + conn(5000) + は(3000) = 13000 > 今日は(9000)
+        // Now 今日(2000) + conn(5000) + は(2000) = 9000 > 今日は(6000)
         assert_eq!(surfaces, vec!["今日は"]);
     }
 
@@ -464,5 +552,81 @@ mod tests {
         let candidates = candidates_for_reading("きょう", &dict);
         // 今日(3000) should come before キョウ(2000+20000=22000)
         assert_eq!(candidates[0].surface, "今日");
+    }
+
+    #[test]
+    fn test_hiragana_passthrough_single_char() {
+        // Dictionary has only kanji for "し" (市, etc.), no hiragana surface.
+        // Passthrough should add "し" as an edge.
+        let csv = "市,1,1,4998,名詞,一般,*,*,*,*,市,シ,シ\n";
+        let reader = std::io::BufReader::new(csv.as_bytes());
+        let dict = Dictionary::load_from_reader(reader).unwrap();
+
+        let result = convert("し", &dict).unwrap();
+        // Passthrough cost(1) = 7000 > 市(4998), so 市 wins (unigram only)
+        assert_eq!(result[0].surface, "市");
+
+        // But if kanji cost is higher than passthrough, passthrough wins
+        let csv2 = "市,1,1,8000,名詞,一般,*,*,*,*,市,シ,シ\n";
+        let dict2 = Dictionary::load_from_reader(std::io::BufReader::new(csv2.as_bytes())).unwrap();
+        let result2 = convert("し", &dict2).unwrap();
+        assert_eq!(result2[0].surface, "し");
+    }
+
+    #[test]
+    fn test_hiragana_multichar_passthrough_beats_wrong_segmentation() {
+        // Simulates the "していて" problem:
+        // Dictionary has 指定(してい, cost=3781) and て(cost=5170),
+        // but no verb conjugation form "して" or "していて".
+        // The multi-char passthrough "していて" (4 chars, cost=8500) should
+        // beat "指定+て" (3781+5170=8951).
+        let csv = "指定,1,1,3781,名詞,一般,*,*,*,*,指定,シテイ,シテイ\n\
+                   て,2,2,5170,助詞,接続助詞,*,*,*,*,て,テ,テ\n";
+        let reader = std::io::BufReader::new(csv.as_bytes());
+        let dict = Dictionary::load_from_reader(reader).unwrap();
+
+        let result = convert("していて", &dict).unwrap();
+        let combined: String = result.iter().map(|s| s.surface.as_str()).collect();
+        // Should stay hiragana rather than become "指定て"
+        assert_eq!(combined, "していて");
+    }
+
+    #[test]
+    fn test_hiragana_passthrough_doesnt_break_good_kanji() {
+        // Common words should still convert to kanji
+        let csv = "今日,1,1,3000,名詞,一般,*,*,*,*,今日,キョウ,キョー\n\
+                   楽しみ,2,2,4000,名詞,一般,*,*,*,*,楽しみ,タノシミ,タノシミ\n\
+                   真,3,3,4000,名詞,一般,*,*,*,*,真,シン,シン\n";
+        let reader = std::io::BufReader::new(csv.as_bytes());
+        let dict = Dictionary::load_from_reader(reader).unwrap();
+
+        // "きょう" → 今日 (3000 < passthrough 8000)
+        let result = convert("きょう", &dict).unwrap();
+        assert_eq!(result[0].surface, "今日");
+
+        // "たのしみ" → 楽しみ (4000 < passthrough 8500)
+        let result2 = convert("たのしみ", &dict).unwrap();
+        assert_eq!(result2[0].surface, "楽しみ");
+
+        // "しん" → 真 (4000 < passthrough 7500)
+        let result3 = convert("しん", &dict).unwrap();
+        assert_eq!(result3[0].surface, "真");
+    }
+
+    #[test]
+    fn test_candidates_hiragana_passthrough_cost() {
+        let csv = "指定,1,1,3781,名詞,一般,*,*,*,*,指定,シテイ,シテイ\n";
+        let reader = std::io::BufReader::new(csv.as_bytes());
+        let dict = Dictionary::load_from_reader(reader).unwrap();
+
+        let candidates = candidates_for_reading("してい", &dict);
+        // Should have 指定 and "してい" (hiragana passthrough)
+        let surfaces: Vec<&str> = candidates.iter().map(|c| c.surface.as_str()).collect();
+        assert!(surfaces.contains(&"指定"));
+        assert!(surfaces.contains(&"してい"));
+
+        // Hiragana passthrough cost should use hiragana formula, not 30000
+        let passthrough = candidates.iter().find(|c| c.surface == "してい").unwrap();
+        assert_eq!(passthrough.cost, hiragana_passthrough_cost(3)); // 8000
     }
 }
