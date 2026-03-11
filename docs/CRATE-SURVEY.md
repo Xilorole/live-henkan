@@ -91,7 +91,26 @@ IPAdicのCSVを直接パースする。後者のほうが依存が軽い。
 
 ---
 
-## Layer 4: Windows TSF
+## Layer 4: Neural LM Inference
+
+### Candidates
+
+| Crate | Downloads | Last Update | API | Verdict |
+|-------|-----------|-------------|-----|---------|
+| `candle-core`+`candle-nn` | 高 | Active (HuggingFace) | Tensor ops + nn modules | **ADOPT** |
+| `ort` (ONNX Runtime) | 中 | Active | ONNX model loading | C++ dependency, heavy |
+| `tch-rs` (LibTorch) | 中 | Active | PyTorch bindings | C++ dependency, 2GB+ |
+| `burn` | 中 | Active | Pure Rust ML | API less mature than candle |
+
+### Decision: `candle` を採用
+
+pure-Rust で依存が軽く、safetensors ロードをネイティブサポート。
+IME はユーザーの PC で動くので、C++ ランタイム依存は避けたい。
+candle は HuggingFace 公式で LLM 推論に実績あり。
+
+---
+
+## Layer 5: Windows TSF
 
 ### 参考実装
 
