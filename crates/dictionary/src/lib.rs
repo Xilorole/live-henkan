@@ -179,9 +179,21 @@ impl Dictionary {
             entries.sort_by_key(|e| e.cost);
         }
 
-        Ok(Dictionary {
+        let mut dict = Dictionary {
             entries: all_entries,
-        })
+        };
+
+        // Load supplemental dictionary if present (UTF-8, same CSV format)
+        let supplemental_path = dir.parent().map(|p| p.join("supplemental.csv"));
+        if let Some(ref path) = supplemental_path {
+            if path.exists() {
+                let file = std::fs::File::open(path).map_err(DictError::Io)?;
+                let reader = std::io::BufReader::new(file);
+                dict.load_supplemental(reader)?;
+            }
+        }
+
+        Ok(dict)
     }
 
     /// Load dictionary from a single IPAdic CSV reader (UTF-8).
@@ -279,6 +291,27 @@ impl Dictionary {
     /// Whether the dictionary is empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Add a single entry to the dictionary, keeping the entry list sorted.
+    pub fn add_entry(&mut self, entry: DictEntry) {
+        let reading = entry.reading.clone();
+        let entries = self.entries.entry(reading).or_default();
+        entries.push(entry);
+        entries.sort_by_key(|e| e.cost);
+    }
+
+    /// Load a supplemental dictionary (UTF-8 CSV, same format as IPAdic).
+    ///
+    /// Entries are merged into the existing dictionary.
+    pub fn load_supplemental(&mut self, reader: impl BufRead) -> Result<(), DictError> {
+        let partial = Self::load_from_reader(reader)?;
+        for (reading, new_entries) in partial.entries {
+            let entries = self.entries.entry(reading).or_default();
+            entries.extend(new_entries);
+            entries.sort_by_key(|e| e.cost);
+        }
+        Ok(())
     }
 }
 
