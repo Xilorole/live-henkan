@@ -6,5 +6,6 @@ edition.workspace = true
 [dependencies]
 engine = { path = "../engine" }
 dictionary = { path = "../dictionary" }
+scorer = { path = "../scorer" }
 ratatui.workspace = true
 crossterm.workspace = true

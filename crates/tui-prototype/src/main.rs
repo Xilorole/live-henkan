@@ -56,6 +56,19 @@ fn main() -> io::Result<()> {
 
     let mut engine = LiveEngine::new(dict, conn);
 
+    // Try loading neural LM scorer (downloads jinen model on first run)
+    eprintln!("Loading neural LM scorer...");
+    match scorer::LMScorer::load_default() {
+        Ok(lm) => {
+            engine.set_scorer(lm);
+            eprintln!("Neural LM scorer loaded. Re-ranking enabled.");
+        }
+        Err(e) => {
+            eprintln!("Neural LM scorer not available: {e}");
+            eprintln!("Continuing with Viterbi-only conversion.");
+        }
+    }
+
     // Setup terminal
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
