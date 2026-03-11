@@ -3,7 +3,7 @@
 //! Processes keystroke-by-keystroke input and produces continuously
 //! updated conversion output — the core of "live conversion".
 
-use converter::{convert_with_conn_ctx, Segment};
+use converter::{candidates_for_reading, convert_with_conn_ctx, Segment};
 use dictionary::{ConnectionCost, Dictionary};
 use romaji::IncrementalRomaji;
 use thiserror::Error;
@@ -14,6 +14,26 @@ pub enum EngineError {
     Dict(#[from] dictionary::DictError),
     #[error("Conversion error: {0}")]
     Convert(#[from] converter::ConvertError),
+}
+
+/// Engine operating mode.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EngineMode {
+    /// Normal composing mode — conversion updates on each keystroke.
+    Composing,
+    /// Candidate selection mode — user is picking from alternatives.
+    Selecting,
+}
+
+/// A segment for display, with optional active marker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplaySegment {
+    /// Surface form to display.
+    pub surface: String,
+    /// Hiragana reading.
+    pub reading: String,
+    /// Whether this segment is the one being edited.
+    pub is_active: bool,
 }
 
 /// Output produced after each keystroke.
@@ -51,6 +71,14 @@ pub struct LiveEngine {
     cached_segments: Option<Vec<Segment>>,
     /// The hiragana input that produced `cached_segments`.
     cached_hiragana: String,
+    /// Current operating mode.
+    mode: EngineMode,
+    /// Per-segment candidate lists (populated when entering selection mode).
+    segment_candidates: Vec<Vec<Segment>>,
+    /// Currently selected candidate index for each segment.
+    candidate_indices: Vec<usize>,
+    /// Index of the segment currently being edited.
+    active_segment: usize,
 }
 
 impl LiveEngine {
@@ -65,6 +93,10 @@ impl LiveEngine {
             last_right_id: 0,
             cached_segments: None,
             cached_hiragana: String::new(),
+            mode: EngineMode::Composing,
+            segment_candidates: Vec::new(),
+            candidate_indices: Vec::new(),
+            active_segment: 0,
         }
     }
 
@@ -74,7 +106,14 @@ impl LiveEngine {
     /// runs the converter on the full hiragana buffer, and returns the result.
     /// When composing text exceeds [`AUTO_COMMIT_THRESHOLD`] characters,
     /// leading segments are auto-committed.
+    ///
+    /// If the engine is in selection mode, exits selection first, applying
+    /// the current candidate choices.
     pub fn on_key(&mut self, ch: char) -> EngineOutput {
+        // Exit selection mode on text input, keeping current choices
+        if self.mode == EngineMode::Selecting {
+            self.apply_selection();
+        }
         let romaji_out = self.romaji.feed(ch);
         self.hiragana_buf.push_str(&romaji_out.confirmed);
 
@@ -256,6 +295,10 @@ impl LiveEngine {
         self.last_right_id = 0;
         self.cached_segments = None;
         self.cached_hiragana.clear();
+        self.mode = EngineMode::Composing;
+        self.segment_candidates.clear();
+        self.candidate_indices.clear();
+        self.active_segment = 0;
     }
 
     /// Get all committed text so far.
@@ -266,6 +309,197 @@ impl LiveEngine {
     /// Get current hiragana buffer (for debugging/display).
     pub fn hiragana_buffer(&self) -> &str {
         &self.hiragana_buf
+    }
+
+    /// Get the current engine mode.
+    pub fn mode(&self) -> &EngineMode {
+        &self.mode
+    }
+
+    /// Enter candidate selection mode.
+    ///
+    /// Returns `true` if selection mode was entered. Returns `false` if
+    /// there is nothing to select (no composing text).
+    pub fn enter_selection(&mut self) -> bool {
+        let segments = match &self.cached_segments {
+            Some(segs) if !segs.is_empty() => segs.clone(),
+            _ => return false,
+        };
+
+        // Build candidate lists for each segment
+        let mut all_candidates = Vec::with_capacity(segments.len());
+        let mut indices = Vec::with_capacity(segments.len());
+
+        for seg in &segments {
+            let candidates = candidates_for_reading(&seg.reading, &self.dict);
+            // Find the index of the current surface in candidates
+            let idx = candidates
+                .iter()
+                .position(|c| c.surface == seg.surface)
+                .unwrap_or(0);
+            indices.push(idx);
+            all_candidates.push(candidates);
+        }
+
+        self.segment_candidates = all_candidates;
+        self.candidate_indices = indices;
+        self.active_segment = 0;
+        self.mode = EngineMode::Selecting;
+        true
+    }
+
+    /// Exit selection mode, discarding candidate choices and
+    /// reverting to the Viterbi best path.
+    pub fn cancel_selection(&mut self) {
+        self.mode = EngineMode::Composing;
+        self.segment_candidates.clear();
+        self.candidate_indices.clear();
+        self.active_segment = 0;
+    }
+
+    /// Exit selection mode, applying the current candidate choices
+    /// to the cached segments.
+    fn apply_selection(&mut self) {
+        if self.mode != EngineMode::Selecting {
+            return;
+        }
+        if let Some(ref mut segments) = self.cached_segments {
+            for (i, seg) in segments.iter_mut().enumerate() {
+                if i < self.segment_candidates.len() && i < self.candidate_indices.len() {
+                    let ci = self.candidate_indices[i];
+                    if let Some(chosen) = self.segment_candidates[i].get(ci) {
+                        seg.surface = chosen.surface.clone();
+                        seg.left_id = chosen.left_id;
+                        seg.right_id = chosen.right_id;
+                        seg.cost = chosen.cost;
+                    }
+                }
+            }
+        }
+        self.mode = EngineMode::Composing;
+        self.segment_candidates.clear();
+        self.candidate_indices.clear();
+        self.active_segment = 0;
+    }
+
+    /// Confirm the current selection and commit the composed text.
+    ///
+    /// Applies candidate choices, commits all segments, and resets.
+    pub fn confirm_selection(&mut self) -> String {
+        self.apply_selection();
+        self.commit()
+    }
+
+    /// Move to the next candidate for the active segment.
+    pub fn next_candidate(&mut self) {
+        if self.mode != EngineMode::Selecting {
+            return;
+        }
+        if let Some(candidates) = self.segment_candidates.get(self.active_segment) {
+            if !candidates.is_empty() {
+                let idx = &mut self.candidate_indices[self.active_segment];
+                *idx = (*idx + 1) % candidates.len();
+            }
+        }
+    }
+
+    /// Move to the previous candidate for the active segment.
+    pub fn prev_candidate(&mut self) {
+        if self.mode != EngineMode::Selecting {
+            return;
+        }
+        if let Some(candidates) = self.segment_candidates.get(self.active_segment) {
+            if !candidates.is_empty() {
+                let idx = &mut self.candidate_indices[self.active_segment];
+                *idx = if *idx == 0 {
+                    candidates.len() - 1
+                } else {
+                    *idx - 1
+                };
+            }
+        }
+    }
+
+    /// Move to the next segment (rightward).
+    pub fn next_segment(&mut self) {
+        if self.mode != EngineMode::Selecting {
+            return;
+        }
+        if self.active_segment + 1 < self.segment_candidates.len() {
+            self.active_segment += 1;
+        }
+    }
+
+    /// Move to the previous segment (leftward).
+    pub fn prev_segment(&mut self) {
+        if self.mode != EngineMode::Selecting {
+            return;
+        }
+        if self.active_segment > 0 {
+            self.active_segment -= 1;
+        }
+    }
+
+    /// Get the display segments for the current composing text.
+    ///
+    /// In selection mode, surfaces reflect the currently selected candidates.
+    /// Returns an empty vec if there is no composing text.
+    pub fn display_segments(&self) -> Vec<DisplaySegment> {
+        let segments = match &self.cached_segments {
+            Some(segs) => segs,
+            None => return Vec::new(),
+        };
+
+        segments
+            .iter()
+            .enumerate()
+            .map(|(i, seg)| {
+                let surface = if self.mode == EngineMode::Selecting {
+                    // Use the selected candidate's surface
+                    self.segment_candidates
+                        .get(i)
+                        .and_then(|cands| cands.get(self.candidate_indices[i]))
+                        .map(|c| c.surface.clone())
+                        .unwrap_or_else(|| seg.surface.clone())
+                } else {
+                    seg.surface.clone()
+                };
+                DisplaySegment {
+                    surface,
+                    reading: seg.reading.clone(),
+                    is_active: self.mode == EngineMode::Selecting && i == self.active_segment,
+                }
+            })
+            .collect()
+    }
+
+    /// Get the candidate list for the active segment.
+    ///
+    /// Returns an empty slice if not in selection mode.
+    pub fn current_candidates(&self) -> &[Segment] {
+        if self.mode != EngineMode::Selecting {
+            return &[];
+        }
+        self.segment_candidates
+            .get(self.active_segment)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Get the index of the currently selected candidate.
+    pub fn active_candidate_index(&self) -> usize {
+        if self.mode != EngineMode::Selecting {
+            return 0;
+        }
+        self.candidate_indices
+            .get(self.active_segment)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Get the index of the active segment.
+    pub fn active_segment_index(&self) -> usize {
+        self.active_segment
     }
 }
 
@@ -380,5 +614,142 @@ mod tests {
         let out = engine.backspace();
         assert_eq!(out.composing, "");
         assert_eq!(out.raw_pending, "");
+    }
+
+    #[test]
+    fn test_engine_enter_selection_empty() {
+        let mut engine = test_engine();
+        // No composing text → cannot enter selection
+        assert!(!engine.enter_selection());
+        assert_eq!(*engine.mode(), EngineMode::Composing);
+    }
+
+    #[test]
+    fn test_engine_enter_selection_with_composing() {
+        let mut engine = test_engine();
+        for ch in "kyou".chars() {
+            engine.on_key(ch);
+        }
+        // hiragana_buf = "きょう", composing = "今日"
+        assert!(engine.enter_selection());
+        assert_eq!(*engine.mode(), EngineMode::Selecting);
+
+        // Should have candidates for "きょう"
+        let candidates = engine.current_candidates();
+        assert!(!candidates.is_empty());
+        // First candidate should be the Viterbi pick (今日)
+        assert_eq!(candidates[engine.active_candidate_index()].surface, "今日");
+    }
+
+    #[test]
+    fn test_engine_next_prev_candidate() {
+        let mut engine = test_engine();
+        for ch in "kyou".chars() {
+            engine.on_key(ch);
+        }
+        engine.enter_selection();
+
+        let first = engine.active_candidate_index();
+        engine.next_candidate();
+        let second = engine.active_candidate_index();
+        assert_ne!(first, second);
+
+        engine.prev_candidate();
+        assert_eq!(engine.active_candidate_index(), first);
+    }
+
+    #[test]
+    fn test_engine_candidate_wraps_around() {
+        let mut engine = test_engine();
+        for ch in "kyou".chars() {
+            engine.on_key(ch);
+        }
+        engine.enter_selection();
+
+        let count = engine.current_candidates().len();
+        // Keep pressing next to wrap around
+        for _ in 0..count {
+            engine.next_candidate();
+        }
+        // Should wrap back to original
+        assert_eq!(engine.active_candidate_index(), 0);
+    }
+
+    #[test]
+    fn test_engine_next_prev_segment() {
+        let mut engine = test_engine();
+        // Type "kyouha" → "きょうは" → two segments "今日" + "は"
+        for ch in "kyouha".chars() {
+            engine.on_key(ch);
+        }
+        engine.enter_selection();
+        assert_eq!(engine.active_segment_index(), 0);
+
+        let seg_count = engine.display_segments().len();
+        if seg_count > 1 {
+            engine.next_segment();
+            assert_eq!(engine.active_segment_index(), 1);
+            engine.prev_segment();
+            assert_eq!(engine.active_segment_index(), 0);
+        }
+    }
+
+    #[test]
+    fn test_engine_display_segments_in_selection() {
+        let mut engine = test_engine();
+        for ch in "kyou".chars() {
+            engine.on_key(ch);
+        }
+        engine.enter_selection();
+
+        let segs = engine.display_segments();
+        assert!(!segs.is_empty());
+        assert!(segs[0].is_active);
+        assert_eq!(segs[0].surface, "今日");
+    }
+
+    #[test]
+    fn test_engine_confirm_selection() {
+        let mut engine = test_engine();
+        for ch in "kyou".chars() {
+            engine.on_key(ch);
+        }
+        engine.enter_selection();
+        engine.next_candidate(); // switch from 今日 to another candidate
+
+        let committed = engine.confirm_selection();
+        assert!(!committed.is_empty());
+        assert_eq!(*engine.mode(), EngineMode::Composing);
+        assert!(engine.hiragana_buffer().is_empty());
+    }
+
+    #[test]
+    fn test_engine_cancel_selection() {
+        let mut engine = test_engine();
+        for ch in "kyou".chars() {
+            engine.on_key(ch);
+        }
+        engine.enter_selection();
+        engine.cancel_selection();
+
+        assert_eq!(*engine.mode(), EngineMode::Composing);
+        // Composing should revert to Viterbi best
+        let segs = engine.display_segments();
+        assert!(!segs.is_empty());
+        assert_eq!(segs[0].surface, "今日");
+    }
+
+    #[test]
+    fn test_engine_on_key_exits_selection() {
+        let mut engine = test_engine();
+        for ch in "kyou".chars() {
+            engine.on_key(ch);
+        }
+        engine.enter_selection();
+        assert_eq!(*engine.mode(), EngineMode::Selecting);
+
+        // Typing a new character should exit selection
+        engine.on_key('h');
+        assert_eq!(*engine.mode(), EngineMode::Composing);
     }
 }
