@@ -113,6 +113,7 @@ fn test_full_sentence_conversion() {
         "きょうはいいてんきですね",
         "あなたとあうのをたのしみにしていました",
         "きょうはいいてんきだとおもいますか",
+        "けっかをぶんせきしたいとおもっています",
     ];
     for input in cases {
         let result = converter::convert_with_conn(input, &dict, &conn).unwrap();

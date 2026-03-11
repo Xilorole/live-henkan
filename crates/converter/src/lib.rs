@@ -179,6 +179,12 @@ impl Lattice {
                 // This creates edges like "して", "していて" that can compete
                 // with wrong kanji segmentations when verb conjugation forms
                 // are absent from the dictionary.
+                //
+                // Skip multi-char passthrough when the dictionary already has
+                // entries covering the same span — prevents passthrough from
+                // competing with legitimate kanji conversions like 分析.
+                let dict_end_positions: Vec<usize> = matches.iter().map(|(end, _)| *end).collect();
+
                 let mut end_byte = char_len;
                 let mut n = 1usize;
                 for next_ch in input[pos + char_len..].chars() {
@@ -187,6 +193,12 @@ impl Lattice {
                     }
                     n += 1;
                     end_byte += next_ch.len_utf8();
+
+                    // Skip if dictionary already has entries at this exact span
+                    if dict_end_positions.contains(&(pos + end_byte)) {
+                        continue;
+                    }
+
                     let substr = input[pos..pos + end_byte].to_string();
                     edges[pos].push(LatticeEdge {
                         end: pos + end_byte,
