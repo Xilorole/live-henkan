@@ -4,8 +4,7 @@
 Cargo.lock
 
 # Dictionary data (downloaded by scripts/setup-dict.sh)
-data/dictionary/*.txt
-data/dictionary/*.bin
+data/dictionary/
 
 # IDE
 .idea/

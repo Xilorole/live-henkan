@@ -1,61 +1,148 @@
-//! Romaji to Hiragana conversion via Trie-based state machine.
+//! Incremental romaji to hiragana conversion for IME use.
+//!
+//! Wraps [`wana_kana`] (batch conversion) with a stateful interface that
+//! processes one character at a time, tracking confirmed hiragana vs.
+//! pending romaji.
+//!
+//! # Design rationale
+//!
+//! Rather than implementing a custom Trie-based state machine (bug-prone,
+//! must handle all edge cases of romaji tables), we delegate to `wana_kana`
+//! which is well-tested and handles all standard romaji patterns including
+//! digraphs (sh, ch, ts), y-combos, double consonants (っ), and ん ambiguity.
+//!
+//! The incremental wrapper simply accumulates a romaji buffer, calls
+//! `wana_kana::to_hiragana` on each keystroke, and diffs the result to
+//! determine what has been newly confirmed. Performance is not a concern:
+//! `wana_kana` converts ~1000 words/ms.
 //!
 //! # Example
-//! ```
-//! use romaji::{RomajiConverter, RomajiEvent};
 //!
-//! let mut conv = RomajiConverter::new();
-//! // Feeding 'k' is pending (could be ka, ki, ku, ke, ko, ky...)
-//! assert!(matches!(conv.feed('k'), RomajiEvent::Pending(_)));
-//! // Feeding 'a' confirms "か"
-//! assert!(matches!(conv.feed('a'), RomajiEvent::Confirmed(s) if s == "か"));
+//! ```
+//! use romaji::IncrementalRomaji;
+//!
+//! let mut conv = IncrementalRomaji::new();
+//! let out = conv.feed('k');
+//! assert_eq!(out.confirmed, "");
+//! assert_eq!(out.pending, "k");
+//!
+//! let out = conv.feed('a');
+//! assert_eq!(out.confirmed, "か");
+//! assert_eq!(out.pending, "");
 //! ```
 
-/// Events produced by the romaji state machine.
+use wana_kana::to_hiragana::to_hiragana;
+
+/// Result of feeding a single character to the converter.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RomajiEvent {
-    /// A complete hiragana string has been confirmed.
-    Confirmed(String),
-    /// Input is a valid prefix; waiting for more characters.
-    Pending(String),
-    /// Input does not match any romaji sequence.
-    Invalid,
+pub struct RomajiOutput {
+    /// Newly confirmed hiragana from this keystroke.
+    pub confirmed: String,
+    /// Remaining romaji that has not resolved to hiragana yet.
+    pub pending: String,
 }
 
-/// Trie-based romaji to hiragana converter.
+/// Incremental romaji to hiragana converter for IME input.
 ///
-/// Maintains internal state for multi-character sequences (e.g., "sh" → pending, "shi" → "し").
-#[derive(Debug)]
-pub struct RomajiConverter {
-    // TODO: Trie structure + current traversal state
+/// Accumulates a romaji buffer internally and uses `wana_kana::to_hiragana`
+/// on each keystroke. Compares the output with the previous state to determine
+/// what has been newly confirmed.
+#[derive(Debug, Default)]
+pub struct IncrementalRomaji {
+    /// Raw romaji buffer (only the trailing unresolved portion).
+    buffer: String,
+    /// Hiragana confirmed so far in the current composition.
+    confirmed_so_far: String,
 }
 
-impl RomajiConverter {
-    /// Create a new converter with the default romaji table.
+impl IncrementalRomaji {
+    /// Create a new converter.
     pub fn new() -> Self {
-        todo!("Milestone 1: Implement Trie construction from ROMAJI_TABLE")
+        Self::default()
     }
 
-    /// Feed a single character and return the resulting event.
-    pub fn feed(&mut self, ch: char) -> RomajiEvent {
-        todo!("Milestone 1: Implement Trie traversal")
+    /// Feed a single ASCII character and return confirmed hiragana + pending romaji.
+    ///
+    /// Non-ASCII characters are passed through as-is (immediately confirmed).
+    pub fn feed(&mut self, ch: char) -> RomajiOutput {
+        if !ch.is_ascii_alphabetic() {
+            let flushed = self.flush_pending();
+            let mut confirmed = flushed;
+            confirmed.push(ch);
+            return RomajiOutput {
+                confirmed,
+                pending: String::new(),
+            };
+        }
+
+        self.buffer.push(ch);
+
+        let converted = to_hiragana(&self.buffer);
+        let (hiragana_part, romaji_tail) = split_trailing_romaji(&converted);
+
+        if hiragana_part.is_empty() {
+            RomajiOutput {
+                confirmed: String::new(),
+                pending: self.buffer.clone(),
+            }
+        } else {
+            self.confirmed_so_far.push_str(&hiragana_part);
+            self.buffer = romaji_tail.to_string();
+
+            RomajiOutput {
+                confirmed: hiragana_part,
+                pending: self.buffer.clone(),
+            }
+        }
     }
 
-    /// Reset internal state, discarding any pending input.
+    /// Flush any pending romaji, forcing conversion of whatever is buffered.
+    ///
+    /// Useful when the user presses Enter or Space to commit.
+    pub fn flush_pending(&mut self) -> String {
+        if self.buffer.is_empty() {
+            return String::new();
+        }
+        let converted = to_hiragana(&self.buffer);
+        self.buffer.clear();
+        self.confirmed_so_far.push_str(&converted);
+        converted
+    }
+
+    /// Reset all internal state.
     pub fn reset(&mut self) {
-        todo!("Milestone 1")
+        self.buffer.clear();
+        self.confirmed_so_far.clear();
     }
 
-    /// Return the current pending romaji buffer, if any.
-    pub fn pending(&self) -> Option<&str> {
-        todo!("Milestone 1")
+    /// Get the current pending romaji buffer.
+    pub fn pending(&self) -> &str {
+        &self.buffer
+    }
+
+    /// Get all confirmed hiragana accumulated so far.
+    pub fn confirmed_total(&self) -> &str {
+        &self.confirmed_so_far
     }
 }
 
-impl Default for RomajiConverter {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Split a string into leading hiragana and trailing ASCII (romaji) portions.
+///
+/// `"おなj"` becomes `("おな", "j")`.
+/// `"おなじ"` becomes `("おなじ", "")`.
+/// `"sh"` becomes `("", "sh")`.
+fn split_trailing_romaji(s: &str) -> (String, &str) {
+    let last_kana_end = s
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !c.is_ascii())
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+
+    let hiragana = &s[..last_kana_end];
+    let romaji = &s[last_kana_end..];
+
+    (hiragana.to_string(), romaji)
 }
 
 #[cfg(test)]
@@ -64,40 +151,98 @@ mod tests {
 
     #[test]
     fn test_feed_simple_vowel_confirmed() {
-        let mut conv = RomajiConverter::new();
-        assert_eq!(conv.feed('a'), RomajiEvent::Confirmed("あ".into()));
+        let mut conv = IncrementalRomaji::new();
+        let out = conv.feed('a');
+        assert_eq!(out.confirmed, "あ");
+        assert_eq!(out.pending, "");
     }
 
     #[test]
     fn test_feed_consonant_vowel_confirmed() {
-        let mut conv = RomajiConverter::new();
-        assert_eq!(conv.feed('k'), RomajiEvent::Pending("k".into()));
-        assert_eq!(conv.feed('a'), RomajiEvent::Confirmed("か".into()));
-    }
+        let mut conv = IncrementalRomaji::new();
+        let out = conv.feed('k');
+        assert_eq!(out.confirmed, "");
+        assert_eq!(out.pending, "k");
 
-    #[test]
-    fn test_feed_nn_produces_n() {
-        let mut conv = RomajiConverter::new();
-        conv.feed('n');
-        assert_eq!(conv.feed('n'), RomajiEvent::Confirmed("ん".into()));
-    }
-
-    #[test]
-    fn test_feed_n_before_consonant_produces_n() {
-        let mut conv = RomajiConverter::new();
-        conv.feed('n');
-        // 'k' is a consonant → 'n' should resolve to ん, and 'k' becomes new pending
-        let event = conv.feed('k');
-        // Implementation should emit ん and start pending 'k'
-        // Exact API shape depends on implementation — may need multi-event support
-        assert!(matches!(event, RomajiEvent::Confirmed(_) | RomajiEvent::Pending(_)));
+        let out = conv.feed('a');
+        assert_eq!(out.confirmed, "か");
+        assert_eq!(out.pending, "");
     }
 
     #[test]
     fn test_feed_shi_confirmed() {
-        let mut conv = RomajiConverter::new();
-        assert_eq!(conv.feed('s'), RomajiEvent::Pending("s".into()));
-        assert_eq!(conv.feed('h'), RomajiEvent::Pending("sh".into()));
-        assert_eq!(conv.feed('i'), RomajiEvent::Confirmed("し".into()));
+        let mut conv = IncrementalRomaji::new();
+        conv.feed('s');
+        conv.feed('h');
+        let out = conv.feed('i');
+        assert_eq!(out.confirmed, "し");
+        assert_eq!(out.pending, "");
+    }
+
+    #[test]
+    fn test_feed_nn_produces_n() {
+        let mut conv = IncrementalRomaji::new();
+        conv.feed('n');
+        let out = conv.feed('n');
+        assert_eq!(out.confirmed, "ん");
+    }
+
+    #[test]
+    fn test_watashi_sequence() {
+        let mut conv = IncrementalRomaji::new();
+        let mut total = String::new();
+        for ch in "watashi".chars() {
+            total.push_str(&conv.feed(ch).confirmed);
+        }
+        assert_eq!(total, "わたし");
+        assert_eq!(conv.pending(), "");
+    }
+
+    #[test]
+    fn test_flush_pending_n() {
+        let mut conv = IncrementalRomaji::new();
+        conv.feed('n');
+        let flushed = conv.flush_pending();
+        assert_eq!(flushed, "ん");
+        assert_eq!(conv.pending(), "");
+    }
+
+    #[test]
+    fn test_reset_clears_state() {
+        let mut conv = IncrementalRomaji::new();
+        conv.feed('k');
+        conv.reset();
+        assert_eq!(conv.pending(), "");
+        assert_eq!(conv.confirmed_total(), "");
+    }
+
+    #[test]
+    fn test_non_ascii_passthrough() {
+        let mut conv = IncrementalRomaji::new();
+        let out = conv.feed('.');
+        // wana_kana converts '.' to '。' in IME mode, but since it's non-ASCII
+        // we pass through directly
+        assert!(out.confirmed.contains('.'));
+        assert_eq!(out.pending, "");
+    }
+
+    #[test]
+    fn test_split_trailing_romaji_mixed() {
+        assert_eq!(split_trailing_romaji("おなj"), ("おな".into(), "j"));
+    }
+
+    #[test]
+    fn test_split_trailing_romaji_all_kana() {
+        assert_eq!(split_trailing_romaji("おなじ"), ("おなじ".into(), ""));
+    }
+
+    #[test]
+    fn test_split_trailing_romaji_all_ascii() {
+        assert_eq!(split_trailing_romaji("sh"), ("".into(), "sh"));
+    }
+
+    #[test]
+    fn test_split_trailing_romaji_empty() {
+        assert_eq!(split_trailing_romaji(""), ("".into(), ""));
     }
 }

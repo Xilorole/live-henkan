@@ -5,5 +5,5 @@ edition.workspace = true
 
 [dependencies]
 engine = { path = "../engine" }
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui.workspace = true
+crossterm.workspace = true

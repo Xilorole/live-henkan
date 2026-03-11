@@ -11,11 +11,18 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 license = "MIT"
-repository = "https://github.com/Xilorole/live-henkan"
+repository = "https://github.com/<your-username>/live-henkan"
 
 [workspace.dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Romaji ⇔ Hiragana (replaces custom Trie implementation)
+wana_kana = "4"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"

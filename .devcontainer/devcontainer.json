@@ -1,0 +1,57 @@
+{
+    "name": "live-henkan",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/github-cli:1": {},
+        "ghcr.io/devcontainers/features/common-utils:2": {
+            "installZsh": false,
+            "configureZshAsDefaultShell": false
+        }
+    },
+
+    // VS Code extensions (installed inside the container)
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "GitHub.copilot",
+                "GitHub.copilot-chat",
+                "tamasfe.even-better-toml",
+                "vadimcn.vscode-lldb",
+                "usernamehw.errorlens"
+            ],
+            "settings": {
+                "rust-analyzer.cargo.features": "all",
+                "rust-analyzer.check.command": "clippy",
+                "rust-analyzer.check.extraArgs": ["--", "-D", "warnings"],
+                "editor.formatOnSave": true,
+                "[rust]": {
+                    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+                },
+                "terminal.integrated.defaultProfile.linux": "bash"
+            }
+        }
+    },
+
+    // Run after container is created (one-time setup)
+    "postCreateCommand": ".devcontainer/post-create.sh",
+
+    // Run every time container starts
+    "postStartCommand": "echo 'live-henkan devcontainer ready.'",
+
+    // Forward no ports by default (TUI runs in terminal)
+    "forwardPorts": [],
+
+    // Container user (matches devcontainer base image)
+    "remoteUser": "vscode",
+
+    // Mount cargo registry cache to speed up rebuilds across container recreations
+    "mounts": [
+        "source=live-henkan-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+        "source=live-henkan-cargo-git,target=/usr/local/cargo/git,type=volume",
+        "source=live-henkan-target,target=${containerWorkspaceFolder}/target,type=volume"
+    ]
+}

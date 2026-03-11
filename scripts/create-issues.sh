@@ -8,65 +8,67 @@ set -euo pipefail
 REPO_FLAG="" # Add "--repo owner/live-henkan" if needed
 
 gh issue create $REPO_FLAG \
-  --title "feat(romaji): Trie-based romaji to hiragana state machine" \
+  --title "feat(romaji): incremental wana_kana wrapper for IME input" \
   --label "enhancement,milestone:1" \
   --body '## Objective
-Implement a Trie-based state machine that converts romaji input to hiragana, one character at a time.
+Implement an incremental romaji→hiragana converter that wraps `wana_kana` for keystroke-by-keystroke IME input.
 
 ## Crate
 `romaji`
 
+## External Dependencies
+- `wana_kana` (already in Cargo.toml) — handles all romaji→hiragana conversion logic
+
 ## Acceptance Criteria
-- [ ] `RomajiConverter::new()` builds a Trie from the standard romaji table
-- [ ] `feed(char)` returns `Confirmed(String)` when a complete hiragana is produced
-- [ ] `feed(char)` returns `Pending(String)` for valid prefixes
-- [ ] `feed(char)` returns `Invalid` for impossible sequences
-- [ ] `n` + vowel → な行, `n` + consonant → ん + new pending, `nn` → ん
-- [ ] Double consonant (e.g., `kk`) → っ + new pending
-- [ ] All tests in `src/lib.rs` pass
+- [ ] `IncrementalRomaji::feed(char)` returns `RomajiOutput { confirmed, pending }`
+- [ ] Delegates to `wana_kana::to_hiragana()` internally — NO custom Trie or romaji table
+- [ ] `flush_pending()` forces conversion of ambiguous trailing input (e.g., lone `n` → `ん`)
+- [ ] Non-ASCII characters pass through immediately as confirmed
+- [ ] All existing tests in `src/lib.rs` pass
 - [ ] `cargo clippy` clean, doc comments on all pub items
 
-## API
-```rust
-pub enum RomajiEvent { Confirmed(String), Pending(String), Invalid }
-pub struct RomajiConverter { /* trie + state */ }
-impl RomajiConverter {
-    pub fn new() -> Self;
-    pub fn feed(&mut self, ch: char) -> RomajiEvent;
-    pub fn reset(&mut self);
-    pub fn pending(&self) -> Option<&str>;
-}
-```
+## Important
+DO NOT implement a custom romaji table or Trie state machine.
+The `wana_kana` crate handles all edge cases (digraphs, っ, ん ambiguity, etc.).
+The job here is to build an incremental wrapper that diffs batch output.
 
 ## Notes
-- Romaji table should cover: basic vowels, consonant+vowel, digraphs (sh, ch, ts), y-combos (ky, ny, etc.), double consonants, n-special
-- Consider `phf` crate or hand-rolled Trie; hand-rolled is preferred for learning value
+- `split_trailing_romaji()` helper already sketched — splits converted output into leading kana + trailing ASCII
+- Performance is not a concern: wana_kana converts ~1000 words/ms
+- Type stubs and tests are already in `crates/romaji/src/lib.rs`
 '
 
 gh issue create $REPO_FLAG \
-  --title "feat(dictionary): mozc dictionary parser and lookup" \
+  --title "feat(dictionary): IPAdic parser with reading-based reverse index" \
   --label "enhancement,milestone:2" \
   --body '## Objective
-Load mozc-format TSV dictionary files and provide exact match + common prefix search.
+Parse mecab-ipadic CSV files and build a reading-indexed dictionary for kana→kanji conversion.
 
 ## Crate
 `dictionary`
 
 ## Acceptance Criteria
-- [ ] Parse mozc TSV format: `reading\t(lid)\t(rid)\tcost\tsurface`
-- [ ] `Dictionary::lookup(reading)` returns matching entries sorted by cost
+- [ ] Parse IPAdic CSV format: `surface,left_id,right_id,cost,pos1,...,reading,pronunciation`
+- [ ] Normalize katakana readings to hiragana (IPAdic stores readings in katakana)
+- [ ] `Dictionary::lookup(reading)` returns entries sorted by cost ascending
 - [ ] `Dictionary::common_prefix_search(input, start)` returns all prefix matches
-- [ ] Handle loading errors gracefully with `DictError`
-- [ ] Unit tests with small inline test dictionaries
-- [ ] Integration test with a sample subset of mozc dictionary
+- [ ] `ConnectionCost::from_reader()` parses `matrix.def` for bigram costs
+- [ ] Integration test loading a real IPAdic file subset
+- [ ] Handle encoding (IPAdic is EUC-JP by default; use UTF-8 repackaged version)
+
+## Why Self-Implement?
+lindera/vibrato are morphological analyzers that match on **surface forms** (漢字).
+We need the reverse: match on **readings** (ひらがな) → surface forms (漢字).
+See `docs/CRATE-SURVEY.md` for detailed rationale.
 
 ## Dependencies
-- `scripts/setup-dict.sh` must be run first to download dictionary files
+- `scripts/setup-dict.sh` must be run first to download IPAdic files
 
 ## Notes
-- Start with `HashMap<String, Vec<DictEntry>>` for storage
-- Common prefix search: iterate char boundaries from `start`, check each prefix
-- Consider a `build.rs` step later for binary compilation (not required for M2)
+- `katakana_to_hiragana()` helper is already implemented in lib.rs
+- For Common Prefix Search: iterate char boundaries from `start`, check each prefix in HashMap
+- Consider Double-Array Trie (`yada` or `daachorse` crate) as future optimization if HashMap is too slow
+- IPAdic reading field is the second-to-last field in the CSV (index varies by POS)
 '
 
 gh issue create $REPO_FLAG \
@@ -79,18 +81,18 @@ Build a word lattice (DAG) from a hiragana string using dictionary common prefix
 `converter`
 
 ## Acceptance Criteria
-- [ ] `Lattice::build(input, dict)` constructs edges for all dictionary matches
-- [ ] Unknown-word fallback: single hiragana character edges with high cost
-- [ ] Every position in the input is reachable (no gaps in the lattice)
-- [ ] Test with small dictionary: verify correct number of edges
+- [ ] `Lattice::build(input, dict)` constructs edges for all dictionary matches by reading
+- [ ] Unknown-word fallback: single hiragana character edges with high cost (e.g., 10000)
+- [ ] Every byte position in the input is reachable (no gaps in the lattice)
+- [ ] Test with small inline dictionary: verify correct number of edges
 
 ## Dependencies
 - Milestone 2 (`dictionary` crate)
 
 ## Notes
 - `edges[i]` = Vec of edges starting at byte position `i` of the input
-- Iterate over each char boundary, run common_prefix_search, add edges
-- For unknown words: add single-char edge with cost = 10000 (configurable)
+- For each char boundary: call `dict.common_prefix_search(input, pos)`, add edges
+- Unknown words ensure the lattice is always connected
 '
 
 gh issue create $REPO_FLAG \
@@ -104,20 +106,17 @@ Implement Viterbi algorithm to find the minimum-cost path through the word latti
 
 ## Acceptance Criteria
 - [ ] `Lattice::find_best_path()` returns `Vec<Segment>` with minimum total cost
-- [ ] Forward pass: compute min cumulative cost to each position
+- [ ] Forward pass: compute min cumulative cost to each byte position
 - [ ] Backward trace: recover the optimal path
 - [ ] Returns `ConvertError::NoPath` if no valid path exists
-- [ ] Test: "きょうはいいてんきです" → reasonable segmentation
-- [ ] Test: single-character input works (fallback to unknown word)
+- [ ] Unigram cost only for first implementation (no connection costs)
+- [ ] Test: small dictionary + known input → expected segmentation
 
 ## Dependencies
 - Milestone 3 (lattice construction)
 
-## Notes
-- Start with unigram cost only (no bigram connection cost)
-- `best_cost[i]` = minimum cost to reach position `i`
-- `best_prev[i]` = (start_position, edge_index) for backtracing
-- Bigram connection costs can be added as a follow-up issue
+## Follow-up
+- Add bigram connection costs using `ConnectionCost::cost(right_id, left_id)` (separate issue)
 '
 
 gh issue create $REPO_FLAG \
@@ -132,31 +131,31 @@ Integrate romaji, dictionary, and converter into a keystroke-driven live convers
 ## Acceptance Criteria
 - [ ] `LiveEngine::on_key(char)` processes input and returns `EngineOutput`
 - [ ] `EngineOutput` contains: committed text, composing text (live conversion), raw pending romaji
-- [ ] Typing "kyouha" produces composing text like "今日は" (with dictionary)
+- [ ] Typing "kyouha" produces composing text with kanji (with dictionary loaded)
 - [ ] `commit()` finalizes current composition
 - [ ] `reset()` clears all state
 - [ ] Works correctly with sequential input (stateful across calls)
 
 ## Dependencies
 - Milestones 1-4
-
-## Notes
-- On each key: feed to romaji → if confirmed, append to hiragana buffer → run converter → update output
-- Deferred commit: only auto-commit early segments when confidence is high (stretch goal)
 '
 
 gh issue create $REPO_FLAG \
   --title "feat(tui-prototype): terminal UI for engine testing" \
   --label "enhancement,milestone:6" \
   --body '## Objective
-Build a terminal UI using ratatui + crossterm to interactively test the live conversion engine.
+Build a terminal UI using `ratatui` + `crossterm` to interactively test the live conversion engine.
 
 ## Crate
 `tui-prototype`
 
+## External Dependencies
+- `ratatui` (already in Cargo.toml) — DO NOT implement terminal rendering from scratch
+- `crossterm` (already in Cargo.toml) — for event handling
+
 ## Acceptance Criteria
 - [ ] Launches a fullscreen TUI in the terminal
-- [ ] Displays: committed text, composing text (underlined), pending romaji
+- [ ] Displays: committed text, composing text (underlined/highlighted), pending romaji
 - [ ] Key input is processed through LiveEngine in real-time
 - [ ] Enter commits current composition
 - [ ] Escape resets
@@ -170,10 +169,18 @@ gh issue create $REPO_FLAG \
   --title "feat(tsf-frontend): Windows TSF IME integration" \
   --label "enhancement,milestone:7,platform:windows" \
   --body '## Objective
-Implement a Windows TSF (Text Services Framework) frontend that connects the live-henkan engine to Windows applications.
+Implement a Windows TSF (Text Services Framework) frontend for the live-henkan engine.
 
 ## Crate
 `tsf-frontend`
+
+## External Dependencies
+- `windows-rs` (already in Cargo.toml) — DO NOT create a custom COM framework
+
+## Reference Implementations
+- `ime-rs` (saschanaz/ime-rs): MS IME sample ported to Rust, excellent TSF reference
+- `windows-chewing-tsf` (chewing): Production Rust TSF IME, GPL-3.0 (reference only)
+- `azooKey-Windows`: Rust TSF client + Swift server architecture
 
 ## Acceptance Criteria
 - [ ] Registers as a Windows IME via TSF
@@ -185,14 +192,13 @@ Implement a Windows TSF (Text Services Framework) frontend that connects the liv
 
 ## Dependencies
 - Milestone 5 (engine)
-- Milestone 6 (TUI prototype for validation)
+- Milestone 6 (TUI prototype for conversion quality validation)
 
 ## Notes
-- TSF requires COM interop — consider `windows-rs` crate
-- Reference: https://docs.microsoft.com/en-us/windows/win32/tsf/text-services-framework
-- May need to implement: ITfTextInputProcessor, ITfKeyEventSink, ITfCompositionSink
+- Implement: ITfTextInputProcessor, ITfKeyEventSink, ITfCompositionSink
 - Build & test on native Windows (not WSL)
+- Study `ime-rs` COM boilerplate patterns closely before starting
 '
 
 echo ""
-echo "All issues created successfully."
+echo "All 7 issues created successfully."

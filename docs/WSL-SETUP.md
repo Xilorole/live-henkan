@@ -1,5 +1,29 @@
 # WSL環境構築ガイド
 
+## 推奨: Dev Container
+
+Docker Desktop (WSL2バックエンド) がインストール済みなら、VS Codeで
+"Reopen in Container" するだけでRust toolchain・just・gh CLI・辞書データが
+すべて自動セットアップされる。ホスト環境を汚さず、CI環境との一貫性も保てる。
+
+```bash
+# 前提: Docker Desktop + VS Code Dev Containers拡張
+git clone https://github.com/<your-username>/live-henkan.git
+code live-henkan/
+# → "Reopen in Container" を承認
+# → post-create.sh が自動実行される
+# → gh auth login を手動で1回だけ実行
+```
+
+cargo registry と target ディレクトリは Docker volume にマウントされるため、
+コンテナを再作成してもキャッシュが残り、再ビルドが速い。
+
+---
+
+## 代替: 手動セットアップ
+
+Docker を使わない場合、以下の手順でWSL上に直接環境を構築する。
+
 ## 前提条件
 
 - Windows 11 + WSL2 (Ubuntu)
